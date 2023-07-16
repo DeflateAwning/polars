@@ -66,9 +66,9 @@ def test_str_decode() -> None:
 
 def test_str_decode_exception() -> None:
     s = pl.Series(["not a valid", "626172", None])
-    with pytest.raises(Exception):
+    with pytest.raises(pl.ComputeError):
         s.str.decode(encoding="hex")
-    with pytest.raises(Exception):
+    with pytest.raises(pl.ComputeError):
         s.str.decode(encoding="base64")
     with pytest.raises(ValueError):
         s.str.decode("utf8")  # type: ignore[arg-type]
@@ -189,8 +189,8 @@ def test_str_strip() -> None:
     expected = pl.Series(["hello", "world"])
     assert_series_equal(s.str.strip(), expected)
 
-    expected = pl.Series(["hello", "worl"])
-    assert_series_equal(s.str.strip().str.strip("d"), expected)
+    expected = pl.Series(["hell", "world"])
+    assert_series_equal(s.str.strip().str.strip("o"), expected)
 
     expected = pl.Series(["ell", "rld\t"])
     assert_series_equal(s.str.strip(" hwo"), expected)
@@ -265,6 +265,11 @@ def test_json_extract_series() -> None:
     expected = pl.Series([{"a": 1}, None, {"a": 2}])
     dtype2 = pl.Struct([pl.Field("a", pl.Int64)])
     assert_series_equal(s.str.json_extract(dtype2), expected)
+
+    s = pl.Series([], dtype=pl.Utf8)
+    expected = pl.Series([], dtype=pl.List(pl.Int64))
+    dtype = pl.List(pl.Int64)
+    assert_series_equal(s.str.json_extract(dtype), expected)
 
 
 def test_json_extract_lazy_expr() -> None:
@@ -629,17 +634,6 @@ def test_decode_strict() -> None:
         df.select(pl.col("strings").str.decode("base64", strict=True))
 
 
-def test_wildcard_expansion() -> None:
-    # one function requires wildcard expansion the other need
-    # this tests the nested behavior
-    # see: #2867
-
-    df = pl.DataFrame({"a": ["x", "Y", "z"], "b": ["S", "o", "S"]})
-    assert df.select(
-        pl.concat_str(pl.all()).str.to_lowercase()
-    ).to_series().to_list() == ["xs", "yo", "zs"]
-
-
 def test_split() -> None:
     df = pl.DataFrame({"x": ["a_a", None, "b", "c_c_c"]})
     out = df.select([pl.col("x").str.split("_")])
@@ -707,3 +701,25 @@ def test_splitn() -> None:
 
     assert_frame_equal(out, expected)
     assert_frame_equal(df["x"].str.splitn("_", 2).to_frame().unnest("x"), expected)
+
+
+def test_titlecase() -> None:
+    df = pl.DataFrame(
+        {
+            "sing": [
+                "welcome to my world",
+                "THERE'S NO TURNING BACK",
+                "double  space",
+                "and\ta\t tab",
+            ]
+        }
+    )
+
+    assert df.select(pl.col("sing").str.to_titlecase()).to_dict(False) == {
+        "sing": [
+            "Welcome To My World",
+            "There's No Turning Back",
+            "Double  Space",
+            "And\tA\t Tab",
+        ]
+    }

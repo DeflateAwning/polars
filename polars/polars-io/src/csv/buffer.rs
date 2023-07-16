@@ -5,7 +5,9 @@ use polars_core::prelude::*;
 #[cfg(any(feature = "dtype-datetime", feature = "dtype-date"))]
 use polars_time::chunkedarray::utf8::Pattern;
 #[cfg(any(feature = "dtype-datetime", feature = "dtype-date"))]
-use polars_time::prelude::utf8::infer::{infer_pattern_single, DatetimeInfer, StrpTimeParser};
+use polars_time::prelude::utf8::infer::{
+    infer_pattern_single, DatetimeInfer, StrpTimeParser, TryFromWithUnit,
+};
 
 use crate::csv::parser::{is_whitespace, skip_whitespace};
 use crate::csv::read_impl::RunningSize;
@@ -61,6 +63,7 @@ trait ParsedBuffer {
         ignore_errors: bool,
         _needs_escaping: bool,
         _missing_is_null: bool,
+        _time_unit: Option<TimeUnit>,
     ) -> PolarsResult<()>;
 }
 
@@ -75,6 +78,7 @@ where
         ignore_errors: bool,
         needs_escaping: bool,
         _missing_is_null: bool,
+        _time_unit: Option<TimeUnit>,
     ) -> PolarsResult<()> {
         if bytes.is_empty() {
             self.append_null()
@@ -100,6 +104,7 @@ where
                             ignore_errors,
                             false, // escaping was already done
                             _missing_is_null,
+                            None,
                         );
                     }
                     polars_ensure!(
@@ -169,6 +174,7 @@ impl ParsedBuffer for Utf8Field {
         ignore_errors: bool,
         needs_escaping: bool,
         missing_is_null: bool,
+        _time_unit: Option<TimeUnit>,
     ) -> PolarsResult<()> {
         if bytes.is_empty() {
             // append null
@@ -277,6 +283,7 @@ impl<'a> CategoricalField<'a> {
         ignore_errors: bool,
         needs_escaping: bool,
         _missing_is_null: bool,
+        _time_unit: Option<TimeUnit>,
     ) -> PolarsResult<()> {
         if bytes.is_empty() {
             self.builder.append_null();
@@ -360,6 +367,7 @@ impl ParsedBuffer for BooleanChunkedBuilder {
         ignore_errors: bool,
         needs_escaping: bool,
         _missing_is_null: bool,
+        _time_unit: Option<TimeUnit>,
     ) -> PolarsResult<()> {
         let bytes = if needs_escaping {
             &bytes[1..bytes.len() - 1]
@@ -403,11 +411,12 @@ impl<T: PolarsNumericType> DatetimeField<T> {
 fn slow_datetime_parser<T>(
     buf: &mut DatetimeField<T>,
     bytes: &[u8],
+    time_unit: Option<TimeUnit>,
     ignore_errors: bool,
 ) -> PolarsResult<()>
 where
     T: PolarsNumericType,
-    DatetimeInfer<T::Native>: TryFrom<Pattern>,
+    DatetimeInfer<T::Native>: TryFromWithUnit<Pattern>,
 {
     let val = if bytes.is_ascii() {
         // Safety:
@@ -423,41 +432,27 @@ where
         return Ok(());
     };
 
-    match &buf.compiled {
-        Some(compiled) => {
-            match DatetimeInfer::<T::Native>::try_from(compiled.pattern_with_offset.pattern) {
-                Ok(mut infer) => {
-                    let parsed = infer.parse(val, compiled.pattern_with_offset.offset);
-                    buf.compiled = Some(infer);
-                    buf.builder.append_option(parsed);
-                    Ok(())
-                }
-                Err(_) => {
-                    buf.builder.append_null();
-                    Ok(())
-                }
-            }
-        }
+    let pattern = match &buf.compiled {
+        Some(compiled) => compiled.pattern,
         None => match infer_pattern_single(val) {
+            Some(pattern) => pattern,
             None => {
                 buf.builder.append_null();
-                Ok(())
-            }
-            Some(pattern_with_offset) => {
-                match DatetimeInfer::<T::Native>::try_from(pattern_with_offset.pattern) {
-                    Ok(mut infer) => {
-                        let parsed = infer.parse(val, pattern_with_offset.offset);
-                        buf.compiled = Some(infer);
-                        buf.builder.append_option(parsed);
-                        Ok(())
-                    }
-                    Err(_) => {
-                        buf.builder.append_null();
-                        Ok(())
-                    }
-                }
+                return Ok(());
             }
         },
+    };
+    match DatetimeInfer::<T::Native>::try_from_with_unit(pattern, time_unit) {
+        Ok(mut infer) => {
+            let parsed = infer.parse(val);
+            buf.compiled = Some(infer);
+            buf.builder.append_option(parsed);
+            Ok(())
+        }
+        Err(_) => {
+            buf.builder.append_null();
+            Ok(())
+        }
     }
 }
 
@@ -465,7 +460,7 @@ where
 impl<T> ParsedBuffer for DatetimeField<T>
 where
     T: PolarsNumericType,
-    DatetimeInfer<T::Native>: TryFrom<Pattern> + StrpTimeParser<T::Native>,
+    DatetimeInfer<T::Native>: TryFromWithUnit<Pattern> + StrpTimeParser<T::Native>,
 {
     #[inline]
     fn parse_bytes(
@@ -474,15 +469,16 @@ where
         ignore_errors: bool,
         needs_escaping: bool,
         _missing_is_null: bool,
+        time_unit: Option<TimeUnit>,
     ) -> PolarsResult<()> {
         if needs_escaping && bytes.len() > 2 {
             bytes = &bytes[1..bytes.len() - 1]
         }
 
         match &mut self.compiled {
-            None => slow_datetime_parser(self, bytes, ignore_errors),
+            None => slow_datetime_parser(self, bytes, time_unit, ignore_errors),
             Some(compiled) => {
-                match compiled.parse_bytes(bytes) {
+                match compiled.parse_bytes(bytes, time_unit) {
                     Some(parsed) => {
                         self.builder.append_value(parsed);
                         Ok(())
@@ -490,7 +486,7 @@ where
                     // fall back on chrono parser
                     // this is a lot slower, we need to do utf8 checking and use
                     // the slower parser
-                    None => slow_datetime_parser(self, bytes, ignore_errors),
+                    None => slow_datetime_parser(self, bytes, time_unit, ignore_errors),
                 }
             }
         }
@@ -538,10 +534,10 @@ pub(crate) fn init_buffers<'a>(
                     ignore_errors,
                 )),
                 #[cfg(feature = "dtype-datetime")]
-                DataType::Datetime(tu, offset) => Buffer::Datetime {
+                DataType::Datetime(time_unit, time_zone) => Buffer::Datetime {
                     buf: DatetimeField::new(name, capacity),
-                    tu: *tu,
-                    offset: offset.clone(),
+                    time_unit: *time_unit,
+                    time_zone: time_zone.clone(),
                 },
                 #[cfg(feature = "dtype-date")]
                 &DataType::Date => Buffer::Date(DatetimeField::new(name, capacity)),
@@ -572,8 +568,8 @@ pub(crate) enum Buffer<'a> {
     #[cfg(feature = "dtype-datetime")]
     Datetime {
         buf: DatetimeField<Int64Type>,
-        tu: TimeUnit,
-        offset: Option<String>,
+        time_unit: TimeUnit,
+        time_zone: Option<TimeZone>,
     },
     #[cfg(feature = "dtype-date")]
     Date(DatetimeField<Int32Type>),
@@ -592,11 +588,15 @@ impl<'a> Buffer<'a> {
             Buffer::Float32(v) => v.finish().into_series(),
             Buffer::Float64(v) => v.finish().into_series(),
             #[cfg(feature = "dtype-datetime")]
-            Buffer::Datetime { buf, tu, offset } => buf
+            Buffer::Datetime {
+                buf,
+                time_unit,
+                time_zone,
+            } => buf
                 .builder
                 .finish()
                 .into_series()
-                .cast(&DataType::Datetime(tu, offset))
+                .cast(&DataType::Datetime(time_unit, time_zone))
                 .unwrap(),
             #[cfg(feature = "dtype-date")]
             Buffer::Date(v) => v
@@ -704,7 +704,7 @@ impl<'a> Buffer<'a> {
             Buffer::Float64(_) => DataType::Float64,
             Buffer::Utf8(_) => DataType::Utf8,
             #[cfg(feature = "dtype-datetime")]
-            Buffer::Datetime { tu, .. } => DataType::Datetime(*tu, None),
+            Buffer::Datetime { time_unit, .. } => DataType::Datetime(*time_unit, None),
             #[cfg(feature = "dtype-date")]
             Buffer::Date(_) => DataType::Date,
             Buffer::Categorical(_) => {
@@ -737,6 +737,7 @@ impl<'a> Buffer<'a> {
                 ignore_errors,
                 needs_escaping,
                 missing_is_null,
+                None,
             ),
             Int32(buf) => <PrimitiveChunkedBuilder<Int32Type> as ParsedBuffer>::parse_bytes(
                 buf,
@@ -744,6 +745,7 @@ impl<'a> Buffer<'a> {
                 ignore_errors,
                 needs_escaping,
                 missing_is_null,
+                None,
             ),
             Int64(buf) => <PrimitiveChunkedBuilder<Int64Type> as ParsedBuffer>::parse_bytes(
                 buf,
@@ -751,6 +753,7 @@ impl<'a> Buffer<'a> {
                 ignore_errors,
                 needs_escaping,
                 missing_is_null,
+                None,
             ),
             UInt64(buf) => <PrimitiveChunkedBuilder<UInt64Type> as ParsedBuffer>::parse_bytes(
                 buf,
@@ -758,6 +761,7 @@ impl<'a> Buffer<'a> {
                 ignore_errors,
                 needs_escaping,
                 missing_is_null,
+                None,
             ),
             UInt32(buf) => <PrimitiveChunkedBuilder<UInt32Type> as ParsedBuffer>::parse_bytes(
                 buf,
@@ -765,6 +769,7 @@ impl<'a> Buffer<'a> {
                 ignore_errors,
                 needs_escaping,
                 missing_is_null,
+                None,
             ),
             Float32(buf) => <PrimitiveChunkedBuilder<Float32Type> as ParsedBuffer>::parse_bytes(
                 buf,
@@ -772,6 +777,7 @@ impl<'a> Buffer<'a> {
                 ignore_errors,
                 needs_escaping,
                 missing_is_null,
+                None,
             ),
             Float64(buf) => <PrimitiveChunkedBuilder<Float64Type> as ParsedBuffer>::parse_bytes(
                 buf,
@@ -779,6 +785,7 @@ impl<'a> Buffer<'a> {
                 ignore_errors,
                 needs_escaping,
                 missing_is_null,
+                None,
             ),
             Utf8(buf) => <Utf8Field as ParsedBuffer>::parse_bytes(
                 buf,
@@ -786,15 +793,19 @@ impl<'a> Buffer<'a> {
                 ignore_errors,
                 needs_escaping,
                 missing_is_null,
+                None,
             ),
             #[cfg(feature = "dtype-datetime")]
-            Datetime { buf, .. } => <DatetimeField<Int64Type> as ParsedBuffer>::parse_bytes(
-                buf,
-                bytes,
-                ignore_errors,
-                needs_escaping,
-                missing_is_null,
-            ),
+            Datetime { buf, time_unit, .. } => {
+                <DatetimeField<Int64Type> as ParsedBuffer>::parse_bytes(
+                    buf,
+                    bytes,
+                    ignore_errors,
+                    needs_escaping,
+                    missing_is_null,
+                    Some(*time_unit),
+                )
+            }
             #[cfg(feature = "dtype-date")]
             Date(buf) => <DatetimeField<Int32Type> as ParsedBuffer>::parse_bytes(
                 buf,
@@ -802,12 +813,13 @@ impl<'a> Buffer<'a> {
                 ignore_errors,
                 needs_escaping,
                 missing_is_null,
+                None,
             ),
             #[allow(unused_variables)]
             Categorical(buf) => {
                 #[cfg(feature = "dtype-categorical")]
                 {
-                    buf.parse_bytes(bytes, ignore_errors, needs_escaping, missing_is_null)
+                    buf.parse_bytes(bytes, ignore_errors, needs_escaping, missing_is_null, None)
                 }
 
                 #[cfg(not(feature = "dtype-categorical"))]

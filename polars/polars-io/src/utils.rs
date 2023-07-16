@@ -60,10 +60,9 @@ pub(crate) fn columns_to_projection(
 
         for column in columns.iter() {
             let Some(&i) = column_names.get(column.as_str()) else {
-                let valid_columns: Vec<String> = schema.fields.iter().map(|f| f.name.clone()).collect();
                 polars_bail!(
                     ColumnNotFound:
-                    "unable to find {:?}; valid columns: {:?}", column, valid_columns,
+                    "unable to find column {:?}; valid columns: {:?}", column, schema.get_names(),
                 );
             };
             prj.push(i);
@@ -105,6 +104,17 @@ pub(crate) fn update_row_counts2(dfs: &mut [DataFrame], offset: IdxSize) {
             previous += n_read;
         }
     }
+}
+
+#[cfg(feature = "json")]
+pub(crate) fn overwrite_schema(
+    schema: &mut Schema,
+    overwriting_schema: &Schema,
+) -> PolarsResult<()> {
+    for (k, value) in overwriting_schema.iter() {
+        *schema.try_get_mut(k)? = value.clone();
+    }
+    Ok(())
 }
 
 #[cfg(test)]

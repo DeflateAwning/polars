@@ -19,8 +19,10 @@ pub mod float;
 pub mod iterator;
 pub mod kernels;
 #[cfg(feature = "ndarray")]
-mod ndarray;
+pub(crate) mod ndarray;
 
+#[cfg(feature = "dtype-array")]
+pub(crate) mod array;
 mod bitwise;
 #[cfg(feature = "object")]
 mod drop;
@@ -268,7 +270,7 @@ impl<T: PolarsDataType> ChunkedArray<T> {
         }
     }
 
-    /// Series to ChunkedArray<T>
+    /// Series to [`ChunkedArray<T>`]
     pub fn unpack_series_matching_type(&self, series: &Series) -> PolarsResult<&ChunkedArray<T>> {
         polars_ensure!(
             self.dtype() == series.dtype(),
@@ -313,27 +315,22 @@ impl<T: PolarsDataType> ChunkedArray<T> {
     }
 
     /// Create a new ChunkedArray from self, where the chunks are replaced.
-    fn copy_with_chunks(
+    ///
+    /// # Safety
+    /// The caller must ensure the dtypes of the chunks are correct
+    unsafe fn copy_with_chunks(
         &self,
         chunks: Vec<ArrayRef>,
         keep_sorted: bool,
         keep_fast_explode: bool,
     ) -> Self {
-        let mut out = ChunkedArray {
-            field: self.field.clone(),
+        Self::from_chunks_and_metadata(
             chunks,
-            phantom: PhantomData,
-            bit_settings: self.bit_settings,
-            length: 0,
-        };
-        out.compute_len();
-        if !keep_sorted {
-            out.set_sorted_flag(IsSorted::Not);
-        }
-        if !keep_fast_explode {
-            out.unset_fast_explode_list()
-        }
-        out
+            self.field.clone(),
+            self.bit_settings,
+            keep_sorted,
+            keep_fast_explode,
+        )
     }
 
     /// Get data type of ChunkedArray.
@@ -341,7 +338,7 @@ impl<T: PolarsDataType> ChunkedArray<T> {
         self.field.data_type()
     }
 
-    #[cfg(feature = "dtype-struct")]
+    #[cfg(any(feature = "dtype-struct", feature = "dtype-categorical"))]
     pub(crate) unsafe fn set_dtype(&mut self, dtype: DataType) {
         self.field = Arc::new(Field::new(self.name(), dtype))
     }
@@ -430,6 +427,8 @@ where
 
 impl AsSinglePtr for BooleanChunked {}
 impl AsSinglePtr for ListChunked {}
+#[cfg(feature = "dtype-array")]
+impl AsSinglePtr for ArrayChunked {}
 impl AsSinglePtr for Utf8Chunked {}
 impl AsSinglePtr for BinaryChunked {}
 #[cfg(feature = "object")]
@@ -514,6 +513,14 @@ impl ValueSize for ListChunked {
     }
 }
 
+#[cfg(feature = "dtype-array")]
+impl ValueSize for ArrayChunked {
+    fn get_values_size(&self) -> usize {
+        self.chunks
+            .iter()
+            .fold(0usize, |acc, arr| acc + arr.get_values_size())
+    }
+}
 impl ValueSize for Utf8Chunked {
     fn get_values_size(&self) -> usize {
         self.chunks
@@ -527,22 +534,6 @@ impl ValueSize for BinaryChunked {
         self.chunks
             .iter()
             .fold(0usize, |acc, arr| acc + arr.get_values_size())
-    }
-}
-
-impl ListChunked {
-    /// Get the inner data type of the list.
-    pub fn inner_dtype(&self) -> DataType {
-        match self.dtype() {
-            DataType::List(dt) => *dt.clone(),
-            _ => unreachable!(),
-        }
-    }
-
-    pub fn set_inner_dtype(&mut self, dtype: DataType) {
-        assert_eq!(dtype.to_physical(), self.inner_dtype().to_physical());
-        let field = Arc::make_mut(&mut self.field);
-        field.coerce(DataType::List(Box::new(dtype)));
     }
 }
 

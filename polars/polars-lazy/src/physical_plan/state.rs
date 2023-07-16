@@ -6,7 +6,7 @@ use bitflags::bitflags;
 use once_cell::sync::OnceCell;
 use polars_core::config::verbose;
 use polars_core::frame::groupby::GroupsProxy;
-use polars_core::frame::hash_join::JoinOptIds;
+use polars_core::frame::hash_join::ChunkJoinOptIds;
 use polars_core::prelude::*;
 #[cfg(any(feature = "parquet", feature = "csv", feature = "ipc"))]
 use polars_plan::logical_plan::FileFingerPrint;
@@ -15,7 +15,7 @@ use polars_plan::logical_plan::FileFingerPrint;
 use super::file_cache::FileCache;
 use crate::physical_plan::node_timer::NodeTimer;
 
-pub type JoinTuplesCache = Arc<Mutex<PlHashMap<String, JoinOptIds>>>;
+pub type JoinTuplesCache = Arc<Mutex<PlHashMap<String, ChunkJoinOptIds>>>;
 pub type GroupsProxyCache = Arc<Mutex<PlHashMap<String, GroupsProxy>>>;
 
 bitflags! {
@@ -25,15 +25,11 @@ bitflags! {
         const VERBOSE = 0x01;
         /// Indicates that window expression's [`GroupTuples`] may be cached.
         const CACHE_WINDOW_EXPR = 0x02;
-        /// A `sort()` in a window function is one level flatter
-        /// Assume we have column a : i32
-        /// than a sort in a groupby. A groupby sorts the groups and returns array: list[i32]
-        /// whereas a window function returns array: i32
-        /// So a `sort().list()` in a groupby returns: list[list[i32]]
-        /// whereas in a window function would return: list[i32]
-        const FINALIZE_WINDOW_AS_LIST = 0x04;
         /// Indicates the expression has a window function
-        const HAS_WINDOW = 0x08;
+        const HAS_WINDOW = 0x04;
+        /// If set, the expression is evaluated in the
+        /// streaming engine.
+        const IN_STREAMING = 0x08;
     }
 }
 
@@ -254,21 +250,6 @@ impl ExecutionState {
         flags.contains(StateFlags::VERBOSE)
     }
 
-    pub(super) fn set_finalize_window_as_list(&self) {
-        self.set_flags(&|mut flags| {
-            flags |= StateFlags::FINALIZE_WINDOW_AS_LIST;
-            flags
-        })
-    }
-
-    pub(super) fn unset_finalize_window_as_list(&self) -> bool {
-        let mut flags: StateFlags = self.flags.load(Ordering::Relaxed).into();
-        let is_set = flags.contains(StateFlags::FINALIZE_WINDOW_AS_LIST);
-        flags.remove(StateFlags::FINALIZE_WINDOW_AS_LIST);
-        self.flags.store(flags.as_u8(), Ordering::Relaxed);
-        is_set
-    }
-
     pub(super) fn remove_cache_window_flag(&mut self) {
         self.set_flags(&|mut flags| {
             flags.remove(StateFlags::CACHE_WINDOW_EXPR);
@@ -288,6 +269,20 @@ impl ExecutionState {
             flags.insert(StateFlags::HAS_WINDOW);
             flags
         });
+    }
+
+    #[cfg(feature = "streaming")]
+    pub(super) fn set_in_streaming_engine(&mut self) {
+        self.set_flags(&|mut flags| {
+            flags.insert(StateFlags::IN_STREAMING);
+            flags
+        });
+    }
+
+    #[cfg(feature = "streaming")]
+    pub(super) fn in_streaming_engine(&self) -> bool {
+        let flags: StateFlags = self.flags.load(Ordering::Relaxed).into();
+        flags.contains(StateFlags::IN_STREAMING)
     }
 }
 

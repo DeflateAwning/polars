@@ -1,10 +1,11 @@
 use std::borrow::Cow;
 use std::fmt;
-use std::fmt::{Debug, Display, Formatter};
+use std::fmt::{Debug, Display, Formatter, Write};
 use std::path::Path;
 
 use crate::prelude::*;
 
+#[allow(clippy::too_many_arguments)]
 fn write_scan<P: Display>(
     f: &mut Formatter,
     name: &str,
@@ -13,6 +14,7 @@ fn write_scan<P: Display>(
     n_columns: i64,
     total_columns: usize,
     predicate: &Option<P>,
+    n_rows: Option<usize>,
 ) -> fmt::Result {
     if indent != 0 {
         writeln!(f)?;
@@ -29,6 +31,9 @@ fn write_scan<P: Display>(
     }
     if let Some(predicate) = predicate {
         write!(f, "\n{:indent$}SELECTION: {predicate}", "")?;
+    }
+    if let Some(n_rows) = n_rows {
+        write!(f, "\n{:indent$}N_ROWS: {n_rows}", "")?;
     }
     Ok(())
 }
@@ -58,6 +63,7 @@ impl LogicalPlan {
                     n_columns,
                     total_columns,
                     &options.predicate,
+                    options.n_rows,
                 )
             }
             AnonymousScan {
@@ -79,92 +85,60 @@ impl LogicalPlan {
                     n_columns,
                     file_info.schema.len(),
                     predicate,
+                    options.n_rows,
                 )
             }
-            Union { inputs, .. } => {
-                write!(f, "{:indent$}UNION:", "")?;
+            Union { inputs, options } => {
+                let mut name = String::new();
+                let name = if let Some(slice) = options.slice {
+                    write!(name, "SLICED UNION: {:?}", slice)?;
+                    name.as_str()
+                } else {
+                    "UNION"
+                };
+                // 3 levels of indentation
+                // - 0 => UNION ... END UNION
+                // - 1 => PLAN 0, PLAN 1, ... PLAN N
+                // - 2 => actual formatting of plans
+                let sub_sub_indent = sub_indent + 2;
+                write!(f, "{:indent$}{}", "", name)?;
                 for (i, plan) in inputs.iter().enumerate() {
-                    write!(f, "\n{:indent$}PLAN {i}:", "")?;
-                    plan._format(f, sub_indent)?;
+                    write!(f, "\n{:sub_indent$}PLAN {i}:", "")?;
+                    plan._format(f, sub_sub_indent)?;
                 }
-                write!(f, "\n{:indent$}END UNION", "")
+                write!(f, "\n{:indent$}END {}", "", name)
             }
             Cache { input, id, count } => {
                 write!(f, "{:indent$}CACHE[id: {:x}, count: {}]", "", *id, *count)?;
                 input._format(f, sub_indent)
             }
-            #[cfg(feature = "parquet")]
-            ParquetScan {
+            Scan {
                 path,
                 file_info,
                 predicate,
-                options,
+                scan_type,
+                file_options,
                 ..
             } => {
-                let n_columns = options
+                let n_columns = file_options
                     .with_columns
                     .as_ref()
                     .map(|columns| columns.len() as i64)
                     .unwrap_or(-1);
                 write_scan(
                     f,
-                    "PARQUET",
+                    scan_type.into(),
                     path,
                     sub_indent,
                     n_columns,
                     file_info.schema.len(),
                     predicate,
-                )
-            }
-            #[cfg(feature = "ipc")]
-            IpcScan {
-                path,
-                file_info,
-                options,
-                predicate,
-                ..
-            } => {
-                let n_columns = options
-                    .with_columns
-                    .as_ref()
-                    .map(|columns| columns.len() as i64)
-                    .unwrap_or(-1);
-                write_scan(
-                    f,
-                    "IPC",
-                    path,
-                    sub_indent,
-                    n_columns,
-                    file_info.schema.len(),
-                    predicate,
+                    file_options.n_rows,
                 )
             }
             Selection { predicate, input } => {
                 write!(f, "{:indent$}FILTER {predicate:?} FROM", "")?;
                 input._format(f, indent)
-            }
-            #[cfg(feature = "csv")]
-            CsvScan {
-                path,
-                options,
-                file_info,
-                predicate,
-                ..
-            } => {
-                let n_columns = options
-                    .with_columns
-                    .as_ref()
-                    .map(|columns| columns.len() as i64)
-                    .unwrap_or(-1);
-                write_scan(
-                    f,
-                    "CSV",
-                    path,
-                    sub_indent,
-                    n_columns,
-                    file_info.schema.len(),
-                    predicate,
-                )
             }
             DataFrameScan {
                 schema,
@@ -210,7 +184,7 @@ impl LogicalPlan {
             } => {
                 write!(f, "{:indent$}AGGREGATE", "")?;
                 write!(f, "\n{:indent$}\t{aggs:?} BY {keys:?} FROM", "")?;
-                write!(f, "\n{:indent$}\t{input:?}", "")
+                input._format(f, sub_indent)
             }
             Join {
                 input_left,
@@ -220,7 +194,7 @@ impl LogicalPlan {
                 options,
                 ..
             } => {
-                let how = &options.how;
+                let how = &options.args.how;
                 write!(f, "{:indent$}{how} JOIN:", "")?;
                 write!(f, "\n{:indent$}LEFT PLAN ON: {left_on:?}", "")?;
                 input_left._format(f, sub_indent)?;
@@ -300,21 +274,21 @@ impl Debug for Expr {
             }
             BinaryExpr { left, op, right } => write!(f, "[({left:?}) {op:?} ({right:?})]"),
             Sort { expr, options } => match options.descending {
-                true => write!(f, "{expr:?} DESC"),
-                false => write!(f, "{expr:?} ASC"),
+                true => write!(f, "{expr:?}.sort(desc)"),
+                false => write!(f, "{expr:?}.sort(asc)"),
             },
             SortBy {
                 expr,
                 by,
                 descending,
             } => {
-                write!(f, "SORT {expr:?} BY {by:?} REVERSE ORDERING {descending:?}",)
+                write!(f, "{expr:?}.sort_by(by={by:?}, descending={descending:?})",)
             }
             Filter { input, by } => {
-                write!(f, "{input:?}\nFILTER WHERE {by:?}")
+                write!(f, "{input:?}.filter({by:?})")
             }
             Take { expr, idx } => {
-                write!(f, "TAKE {expr:?} AT {idx:?}")
+                write!(f, "{expr:?}.take({idx:?})")
             }
             Agg(agg) => {
                 use AggExpr::*;
@@ -370,7 +344,7 @@ impl Debug for Expr {
                 falsy,
             } => write!(
                 f,
-                "\nWHEN {predicate:?}\nTHEN\n\t{truthy:?}\nOTHERWISE\n\t{falsy:?}",
+                ".when({predicate:?}).then({truthy:?}).otherwise({falsy:?})",
             ),
             Function {
                 input, function, ..
@@ -394,12 +368,13 @@ impl Debug for Expr {
                 length,
             } => write!(f, "{input:?}.slice(offset={offset:?}, length={length:?})",),
             Wildcard => write!(f, "*"),
-            Exclude(column, names) => write!(f, "{column:?}, EXCEPT {names:?}"),
-            KeepName(e) => write!(f, "KEEP NAME {e:?}"),
-            RenameAlias { expr, .. } => write!(f, "RENAME_ALIAS {expr:?}"),
-            Columns(names) => write!(f, "COLUMNS({names:?})"),
-            DtypeColumn(dt) => write!(f, "COLUMN OF DTYPE: {dt:?}"),
-            Cache { input, .. } => write!(f, "CACHE {input:?}"),
+            Exclude(column, names) => write!(f, "{column:?}.exclude({names:?})"),
+            KeepName(e) => write!(f, "{e:?}.keep_name()"),
+            RenameAlias { expr, .. } => write!(f, ".rename_alias({expr:?})"),
+            Columns(names) => write!(f, "cols({names:?})"),
+            DtypeColumn(dt) => write!(f, "dtype_columns({dt:?})"),
+            Cache { input, .. } => write!(f, "{input:?}.cache()"),
+            Selector(_) => write!(f, "SELECTOR"),
         }
     }
 }

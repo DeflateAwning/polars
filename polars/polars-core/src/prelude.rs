@@ -17,6 +17,8 @@ pub use crate::chunked_array::builder::{
 pub use crate::chunked_array::iterator::PolarsIterator;
 #[cfg(feature = "dtype-categorical")]
 pub use crate::chunked_array::logical::categorical::*;
+#[cfg(feature = "ndarray")]
+pub use crate::chunked_array::ndarray::IndexOrder;
 #[cfg(feature = "object")]
 pub use crate::chunked_array::object::PolarsObject;
 pub use crate::chunked_array::ops::aggregate::*;
@@ -30,14 +32,16 @@ pub use crate::chunked_array::temporal::conversion::*;
 pub use crate::chunked_array::ChunkedArray;
 pub(crate) use crate::chunked_array::{to_array, ChunkIdIter};
 pub use crate::datatypes::*;
-pub use crate::error::{polars_bail, polars_ensure, polars_err, PolarsError, PolarsResult};
+pub use crate::error::{
+    polars_bail, polars_ensure, polars_err, polars_warn, PolarsError, PolarsResult,
+};
 #[cfg(feature = "asof_join")]
 pub use crate::frame::asof_join::*;
 pub use crate::frame::explode::MeltArgs;
 pub(crate) use crate::frame::groupby::aggregations::*;
 pub use crate::frame::groupby::{GroupsIdx, GroupsProxy, GroupsSlice, IntoGroupsProxy};
-pub use crate::frame::hash_join::JoinType;
 pub(crate) use crate::frame::hash_join::*;
+pub use crate::frame::hash_join::{JoinArgs, JoinType};
 pub use crate::frame::{DataFrame, UniqueKeepStrategy};
 pub use crate::hashing::{FxHash, VecHash};
 pub use crate::named_from::{NamedFrom, NamedFromOwned};

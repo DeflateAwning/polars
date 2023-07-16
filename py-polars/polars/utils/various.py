@@ -4,9 +4,10 @@ import inspect
 import os
 import re
 import sys
+import warnings
 from collections.abc import MappingView, Sized
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Generator, Iterable, Sequence, TypeVar
+from typing import TYPE_CHECKING, Any, Generator, Iterable, Literal, Sequence, TypeVar
 
 import polars as pl
 from polars import functions as F
@@ -18,20 +19,16 @@ from polars.datatypes import (
     Int64,
     Time,
     Utf8,
-    is_polars_dtype,
+    unpack_dtypes,
 )
-
-if sys.version_info >= (3, 8):
-    from typing import Literal
-else:
-    from typing_extensions import Literal
+from polars.dependencies import _PYARROW_AVAILABLE
 
 if TYPE_CHECKING:
     from collections.abc import Reversible
     from pathlib import Path
 
     from polars import DataFrame, Series
-    from polars.type_aliases import PolarsDataType, SizeUnit
+    from polars.type_aliases import PolarsDataType, PolarsIntegerType, SizeUnit
 
     if sys.version_info >= (3, 10):
         from typing import ParamSpec, TypeGuard
@@ -74,11 +71,6 @@ def is_bool_sequence(val: object) -> TypeGuard[Sequence[bool]]:
     return isinstance(val, Sequence) and _is_iterable_of(val, bool)
 
 
-def is_dtype_sequence(val: object) -> TypeGuard[Sequence[PolarsDataType]]:
-    """Check whether the given object is a sequence of polars DataTypes."""
-    return isinstance(val, Sequence) and all(is_polars_dtype(x) for x in val)
-
-
 def is_int_sequence(val: object) -> TypeGuard[Sequence[int]]:
     """Check whether the given sequence is a sequence of integers."""
     return isinstance(val, Sequence) and _is_iterable_of(val, int)
@@ -99,16 +91,17 @@ def is_str_sequence(
 
 
 def range_to_series(
-    name: str, rng: range, dtype: PolarsDataType | None = Int64
+    name: str, rng: range, dtype: PolarsIntegerType | None = None
 ) -> Series:
     """Fast conversion of the given range to a Series."""
-    return F.arange(
+    dtype = dtype or Int64
+    return F.int_range(
         start=rng.start,
         end=rng.stop,
         step=rng.step,
-        eager=True,
         dtype=dtype,
-    ).rename(name, in_place=True)
+        eager=True,
+    ).alias(name)
 
 
 def range_to_slice(rng: range) -> slice:
@@ -176,6 +169,18 @@ def arrlen(obj: Any) -> int | None:
         return None
 
 
+def can_create_dicts_with_pyarrow(dtypes: Sequence[PolarsDataType]) -> bool:
+    """Check if the given dtypes can be used to create dicts with pyarrow fast path."""
+    # TODO: have our own fast-path for dict iteration in Rust
+    return (
+        _PYARROW_AVAILABLE
+        # note: 'ns' precision instantiates values as pandas types - avoid
+        and not any(
+            (getattr(tp, "time_unit", None) == "ns") for tp in unpack_dtypes(*dtypes)
+        )
+    )
+
+
 def normalise_filepath(path: str | Path, check_not_directory: bool = True) -> str:
     """Create a string path, expanding the home directory if present."""
     path = os.path.expanduser(path)
@@ -189,6 +194,13 @@ def parse_version(version: Sequence[str | int]) -> tuple[int, ...]:
     if isinstance(version, str):
         version = version.split(".")
     return tuple(int(re.sub(r"\D", "", str(v))) for v in version)
+
+
+def ordered_unique(values: Sequence[Any]) -> list[Any]:
+    """Return unique list of sequence values, maintaining their order of appearance."""
+    seen: set[Any] = set()
+    add_ = seen.add
+    return [v for v in values if not (v in seen or add_(v))]
 
 
 def scale_bytes(sz: int, unit: SizeUnit) -> int | float:
@@ -332,7 +344,10 @@ class _NoDefault(Enum):
         return "<no_default>"
 
 
-no_default = _NoDefault.no_default  # Sentinel indicating the default value.
+# 'NoDefault' is a sentinel indicating that no default value has been set; note that
+# this should typically be used only when one of the valid parameter values is also
+# None, as otherwise we cannot determine if the caller has explicitly set that value.
+no_default = _NoDefault.no_default
 NoDefault = Literal[_NoDefault.no_default]
 
 
@@ -357,3 +372,38 @@ def find_stacklevel() -> int:
         else:
             break
     return n
+
+
+def _get_stack_locals(
+    of_type: type | tuple[type, ...] | None = None, n_objects: int | None = None
+) -> dict[str, Any]:
+    """
+    Retrieve f_locals from all stack frames (starting from the current frame).
+
+    Parameters
+    ----------
+    of_type
+        Only return objects of this type.
+    n_objects
+        If specified, return only the most recent ``n`` matching objects.
+
+    """
+    objects = {}
+    stack_frame = getattr(inspect.currentframe(), "f_back", None)
+    while stack_frame:
+        local_items = list(stack_frame.f_locals.items())
+        for nm, obj in reversed(local_items):
+            if nm not in objects and (not of_type or isinstance(obj, of_type)):
+                objects[nm] = obj
+                if n_objects is not None and len(objects) >= n_objects:
+                    return objects
+        stack_frame = stack_frame.f_back
+    return objects
+
+
+# this is called from rust
+def _polars_warn(msg: str) -> None:
+    warnings.warn(
+        msg,
+        stacklevel=find_stacklevel(),
+    )

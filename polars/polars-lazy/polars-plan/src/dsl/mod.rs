@@ -6,10 +6,13 @@ pub mod cat;
 pub use cat::*;
 mod arithmetic;
 mod arity;
+#[cfg(feature = "dtype-array")]
+mod array;
 pub mod binary;
 #[cfg(feature = "temporal")]
 pub mod dt;
 mod expr;
+mod expr_dyn_fn;
 mod from;
 pub(crate) mod function_expr;
 #[cfg(feature = "compile")]
@@ -19,6 +22,11 @@ mod list;
 mod meta;
 pub(crate) mod names;
 mod options;
+#[cfg(feature = "python")]
+pub mod python_udf;
+#[cfg(feature = "random")]
+mod random;
+mod selector;
 #[cfg(feature = "strings")]
 pub mod string;
 #[cfg(feature = "dtype-struct")]
@@ -28,10 +36,14 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 pub use arity::*;
+#[cfg(feature = "dtype-array")]
+pub use array::*;
 pub use expr::*;
 pub use function_expr::*;
 pub use functions::*;
 pub use list::*;
+#[cfg(feature = "meta")]
+pub use meta::*;
 pub use options::*;
 use polars_arrow::prelude::QuantileInterpolOptions;
 use polars_core::prelude::*;
@@ -41,6 +53,9 @@ use polars_core::series::IsSorted;
 use polars_core::utils::{try_get_supertype, NoNull};
 #[cfg(feature = "rolling_window")]
 use polars_time::series::SeriesOpsTime;
+pub(crate) use selector::Selector;
+#[cfg(feature = "dtype-struct")]
+pub use struct_::*;
 
 use crate::constants::MAP_LIST_NAME;
 pub use crate::logical_plan::lit;
@@ -103,9 +118,19 @@ impl Expr {
         binary_expr(self, Operator::Eq, other.into())
     }
 
+    /// Compare `Expr` with other `Expr` on equality where `None == None`
+    pub fn eq_missing<E: Into<Expr>>(self, other: E) -> Expr {
+        binary_expr(self, Operator::EqValidity, other.into())
+    }
+
     /// Compare `Expr` with other `Expr` on non-equality
     pub fn neq<E: Into<Expr>>(self, other: E) -> Expr {
         binary_expr(self, Operator::NotEq, other.into())
+    }
+
+    /// Compare `Expr` with other `Expr` on non-equality where `None == None`
+    pub fn neq_missing<E: Into<Expr>>(self, other: E) -> Expr {
+        binary_expr(self, Operator::NotEqValidity, other.into())
     }
 
     /// Check if `Expr` < `Expr`
@@ -254,34 +279,7 @@ impl Expr {
 
     /// Explode the utf8/ list column
     pub fn explode(self) -> Self {
-        let has_filter = has_expr(&self, |e| matches!(e, Expr::Filter { .. }));
-
-        // if we explode right after a window function we don't self join, but just flatten
-        // the expression
-        if let Expr::Window {
-            function,
-            partition_by,
-            order_by,
-            mut options,
-        } = self
-        {
-            if has_filter {
-                panic!("A Filter of a window function is not allowed in combination with explode/flatten.\
-                The resulting column may not fit the DataFrame/ or the groups
-                ")
-            }
-
-            options.explode = true;
-
-            Expr::Explode(Box::new(Expr::Window {
-                function,
-                partition_by,
-                order_by,
-                options,
-            }))
-        } else {
-            Expr::Explode(Box::new(self))
-        }
+        Expr::Explode(Box::new(self))
     }
 
     /// Slice the Series.
@@ -517,12 +515,8 @@ impl Expr {
             output_type,
             options: FunctionOptions {
                 collect_groups: ApplyOptions::ApplyFlat,
-                input_wildcard_expansion: false,
-                auto_explode: false,
                 fmt_str: "map",
-                cast_to_supertypes: false,
-                allow_rename: false,
-                pass_name_to_apply: false,
+                ..Default::default()
             },
         }
     }
@@ -533,10 +527,6 @@ impl Expr {
             function: function_expr,
             options: FunctionOptions {
                 collect_groups: ApplyOptions::ApplyFlat,
-                input_wildcard_expansion: false,
-                auto_explode: false,
-                cast_to_supertypes: false,
-                allow_rename: false,
                 ..Default::default()
             },
         }
@@ -921,6 +911,14 @@ impl Expr {
     /// ╰────────┴────────╯
     /// ```
     pub fn over<E: AsRef<[IE]>, IE: Into<Expr> + Clone>(self, partition_by: E) -> Self {
+        self.over_with_options(partition_by, Default::default())
+    }
+
+    pub fn over_with_options<E: AsRef<[IE]>, IE: Into<Expr> + Clone>(
+        self,
+        partition_by: E,
+        options: WindowOptions,
+    ) -> Self {
         let partition_by = partition_by
             .as_ref()
             .iter()
@@ -930,7 +928,7 @@ impl Expr {
             function: Box::new(self),
             partition_by,
             order_by: None,
-            options: WindowOptions { explode: false },
+            options,
         }
     }
 
@@ -1022,9 +1020,10 @@ impl Expr {
         binary_expr(self, Operator::Or, expr.into())
     }
 
-    /// Filter a single column
-    /// Should be used in aggregation context. If you want to filter on a DataFrame level, use
-    /// [LazyFrame::filter](LazyFrame::filter)
+    /// Filter a single column.
+    ///
+    /// Should be used in aggregation context. If you want to filter on a
+    /// DataFrame level, use `LazyFrame::filter`.
     pub fn filter<E: Into<Expr>>(self, predicate: E) -> Self {
         if has_expr(&self, |e| matches!(e, Expr::Wildcard)) {
             panic!("filter '*' not allowed, use LazyFrame::filter")
@@ -1082,7 +1081,7 @@ impl Expr {
             let by = &s[1];
             let s = &s[0];
             let by = by.cast(&IDX_DTYPE)?;
-            Ok(Some(s.repeat_by(by.idx()?).into_series()))
+            Ok(Some(s.repeat_by(by.idx()?)?.into_series()))
         };
 
         self.apply_many(
@@ -1257,6 +1256,7 @@ impl Expr {
                         tu: Some(tu),
                         tz: tz.as_ref(),
                         closed_window: options.closed_window,
+                        fn_params: options.fn_params.clone(),
                     };
 
                     rolling_fn(s, options).map(Some)
@@ -1278,8 +1278,9 @@ impl Expr {
         }
     }
 
-    /// Apply a rolling min See:
-    /// [ChunkedArray::rolling_min]
+    /// Apply a rolling minimum.
+    ///
+    /// See: [`RollingAgg::rolling_min`]
     #[cfg(feature = "rolling_window")]
     pub fn rolling_min(self, options: RollingOptions) -> Expr {
         self.finish_rolling(
@@ -1291,8 +1292,9 @@ impl Expr {
         )
     }
 
-    /// Apply a rolling max See:
-    /// [ChunkedArray::rolling_max]
+    /// Apply a rolling maximum.
+    ///
+    /// See: [`RollingAgg::rolling_max`]
     #[cfg(feature = "rolling_window")]
     pub fn rolling_max(self, options: RollingOptions) -> Expr {
         self.finish_rolling(
@@ -1304,8 +1306,9 @@ impl Expr {
         )
     }
 
-    /// Apply a rolling mean See:
-    /// [ChunkedArray::rolling_mean]
+    /// Apply a rolling mean.
+    ///
+    /// See: [`RollingAgg::rolling_mean`]
     #[cfg(feature = "rolling_window")]
     pub fn rolling_mean(self, options: RollingOptions) -> Expr {
         self.finish_rolling(
@@ -1317,8 +1320,9 @@ impl Expr {
         )
     }
 
-    /// Apply a rolling sum See:
-    /// [ChunkedArray::rolling_sum]
+    /// Apply a rolling sum.
+    ///
+    /// See: [`RollingAgg::rolling_sum`]
     #[cfg(feature = "rolling_window")]
     pub fn rolling_sum(self, options: RollingOptions) -> Expr {
         self.finish_rolling(
@@ -1330,8 +1334,9 @@ impl Expr {
         )
     }
 
-    /// Apply a rolling median See:
-    /// [`ChunkedArray::rolling_median`]
+    /// Apply a rolling median.
+    ///
+    /// See: [`RollingAgg::rolling_median`]
     #[cfg(feature = "rolling_window")]
     pub fn rolling_median(self, options: RollingOptions) -> Expr {
         self.finish_rolling(
@@ -1343,20 +1348,16 @@ impl Expr {
         )
     }
 
-    /// Apply a rolling quantile See:
-    /// [`ChunkedArray::rolling_quantile`]
+    /// Apply a rolling quantile.
+    ///
+    /// See: [`RollingAgg::rolling_quantile`]
     #[cfg(feature = "rolling_window")]
-    pub fn rolling_quantile(
-        self,
-        quantile: f64,
-        interpolation: QuantileInterpolOptions,
-        options: RollingOptions,
-    ) -> Expr {
+    pub fn rolling_quantile(self, options: RollingOptions) -> Expr {
         self.finish_rolling(
             options,
             "rolling_quantile",
             "rolling_quantile_by",
-            Arc::new(move |s, options| s.rolling_quantile(quantile, interpolation, options)),
+            Arc::new(|s, options| s.rolling_quantile(options)),
             GetOutput::float_type(),
         )
     }
@@ -1458,6 +1459,49 @@ impl Expr {
         .with_fmt("rank")
     }
 
+    #[cfg(feature = "cutqcut")]
+    pub fn cut(
+        self,
+        breaks: Vec<f64>,
+        labels: Option<Vec<String>>,
+        left_closed: bool,
+        include_breaks: bool,
+    ) -> Expr {
+        self.apply_private(FunctionExpr::Cut {
+            breaks,
+            labels,
+            left_closed,
+            include_breaks,
+        })
+    }
+
+    #[cfg(feature = "cutqcut")]
+    pub fn qcut(
+        self,
+        probs: Vec<f64>,
+        labels: Option<Vec<String>>,
+        left_closed: bool,
+        allow_duplicates: bool,
+        include_breaks: bool,
+    ) -> Expr {
+        self.apply_private(FunctionExpr::QCut {
+            probs,
+            labels,
+            left_closed,
+            allow_duplicates,
+            include_breaks,
+        })
+    }
+
+    #[cfg(feature = "rle")]
+    pub fn rle(self) -> Expr {
+        self.apply_private(FunctionExpr::RLE)
+    }
+    #[cfg(feature = "rle")]
+    pub fn rle_id(self) -> Expr {
+        self.apply_private(FunctionExpr::RLEID)
+    }
+
     #[cfg(feature = "diff")]
     pub fn diff(self, n: i64, null_behavior: NullBehavior) -> Expr {
         self.apply_private(FunctionExpr::Diff(n, null_behavior))
@@ -1485,7 +1529,7 @@ impl Expr {
     /// function `skewtest` can be used to determine if the skewness value
     /// is close enough to zero, statistically speaking.
     ///
-    /// see: https://github.com/scipy/scipy/blob/47bb6febaa10658c72962b9615d5d5aa2513fa3a/scipy/stats/stats.py#L1024
+    /// see: [scipy](https://github.com/scipy/scipy/blob/47bb6febaa10658c72962b9615d5d5aa2513fa3a/scipy/stats/stats.py#L1024)
     pub fn skew(self, bias: bool) -> Expr {
         self.apply(
             move |s| {
@@ -1553,45 +1597,6 @@ impl Expr {
         };
         self.apply(move |s| s.reshape(&dims).map(Some), output_type)
             .with_fmt("reshape")
-    }
-
-    #[cfg(feature = "random")]
-    pub fn shuffle(self, seed: Option<u64>) -> Self {
-        self.apply(move |s| Ok(Some(s.shuffle(seed))), GetOutput::same_type())
-            .with_fmt("shuffle")
-    }
-
-    #[cfg(feature = "random")]
-    pub fn sample_n(
-        self,
-        n: usize,
-        with_replacement: bool,
-        shuffle: bool,
-        seed: Option<u64>,
-    ) -> Self {
-        self.apply(
-            move |s| s.sample_n(n, with_replacement, shuffle, seed).map(Some),
-            GetOutput::same_type(),
-        )
-        .with_fmt("sample_n")
-    }
-
-    #[cfg(feature = "random")]
-    pub fn sample_frac(
-        self,
-        frac: f64,
-        with_replacement: bool,
-        shuffle: bool,
-        seed: Option<u64>,
-    ) -> Self {
-        self.apply(
-            move |s| {
-                s.sample_frac(frac, with_replacement, shuffle, seed)
-                    .map(Some)
-            },
-            GetOutput::same_type(),
-        )
-        .with_fmt("sample_frac")
     }
 
     #[cfg(feature = "ewma")]
@@ -1736,13 +1741,7 @@ impl Expr {
     /// This can lead to incorrect results if this `Series` is not sorted!!
     /// Use with care!
     pub fn set_sorted_flag(self, sorted: IsSorted) -> Expr {
-        self.apply(
-            move |mut s| {
-                s.set_sorted_flag(sorted);
-                Ok(Some(s))
-            },
-            GetOutput::same_type(),
-        )
+        self.apply_private(FunctionExpr::SetSortedFlag(sorted))
     }
 
     /// Cache this expression, so that it is executed only once per context.
@@ -1765,6 +1764,10 @@ impl Expr {
         self.map_private(FunctionExpr::Hash(k0, k1, k2, k3))
     }
 
+    pub fn to_physical(self) -> Expr {
+        self.map_private(FunctionExpr::ToPhysical)
+    }
+
     #[cfg(feature = "strings")]
     pub fn str(self) -> string::StringNameSpace {
         string::StringNameSpace(self)
@@ -1778,17 +1781,30 @@ impl Expr {
     pub fn dt(self) -> dt::DateLikeNameSpace {
         dt::DateLikeNameSpace(self)
     }
-    pub fn arr(self) -> list::ListNameSpace {
+
+    pub fn list(self) -> list::ListNameSpace {
         list::ListNameSpace(self)
     }
+
+    /// Get the [`array::ArrayNameSpace`]
+    #[cfg(feature = "dtype-array")]
+    pub fn arr(self) -> array::ArrayNameSpace {
+        array::ArrayNameSpace(self)
+    }
+
+    /// Get the [`CategoricalNameSpace`]
     #[cfg(feature = "dtype-categorical")]
     pub fn cat(self) -> cat::CategoricalNameSpace {
         cat::CategoricalNameSpace(self)
     }
+
+    /// Get the [`struct_::StructNameSpace`]
     #[cfg(feature = "dtype-struct")]
     pub fn struct_(self) -> struct_::StructNameSpace {
         struct_::StructNameSpace(self)
     }
+
+    /// Get the [`meta::MetaNameSpace`]
     #[cfg(feature = "meta")]
     pub fn meta(self) -> meta::MetaNameSpace {
         meta::MetaNameSpace(self)

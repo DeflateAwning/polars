@@ -371,16 +371,6 @@ def test_arithmetic(s: pl.Series) -> None:
         +a
 
 
-def test_arithmetic_empty() -> None:
-    series = pl.Series("a", [])
-    assert series.sum() == 0
-
-
-def test_arithmetic_null() -> None:
-    series = pl.Series("a", [None])
-    assert series.sum() is None
-
-
 def test_power() -> None:
     a = pl.Series([1, 2], dtype=Int64)
     b = pl.Series([None, 2.0], dtype=Float64)
@@ -392,9 +382,10 @@ def test_power() -> None:
     assert_series_equal(a**a, pl.Series([1.0, 4.0], dtype=Float64))
     assert_series_equal(b**b, pl.Series([None, 4.0], dtype=Float64))
     assert_series_equal(a**b, pl.Series([None, 4.0], dtype=Float64))
+    assert_series_equal(a**None, pl.Series([None] * len(a), dtype=Float64))
     with pytest.raises(ValueError):
         c**2
-    with pytest.raises(pl.ComputeError):
+    with pytest.raises(pl.ColumnNotFoundError):
         a ** "hi"  # type: ignore[operator]
 
     # rpow
@@ -402,7 +393,7 @@ def test_power() -> None:
     assert_series_equal(2**b, pl.Series("literal", [None, 4.0], dtype=Float64))
     with pytest.raises(ValueError):
         2**c
-    with pytest.raises(pl.ComputeError):
+    with pytest.raises(pl.ColumnNotFoundError):
         "hi" ** a
 
     # Series.pow() method
@@ -451,7 +442,7 @@ def test_various() -> None:
     assert a.is_null().sum() == 0
     assert a.name == "a"
 
-    a.rename("b", in_place=True)
+    a = a.rename("b")
     assert a.name == "b"
     assert a.len() == 2
     assert len(a) == 2
@@ -494,7 +485,7 @@ def test_series_dtype_is() -> None:
     s = pl.Series("s", ["testing..."])
     assert s.is_utf8()
 
-    s = pl.Series("s", [], dtype=pl.Decimal(20, 15))
+    s = pl.Series("s", [], dtype=pl.Decimal(scale=15, precision=20))
     assert not s.is_float()
     assert s.is_numeric()
     assert s.is_empty()
@@ -568,7 +559,7 @@ def test_to_pandas() -> None:
         if a.dtype == pl.List:
             vals_b = [(None if x is None else x.tolist()) for x in b]
         else:
-            vals_b = b.replace({np.nan: None}).values.tolist()  # type: ignore[union-attr]
+            vals_b = b.replace({np.nan: None}).values.tolist()
 
         assert vals_b == test_data
 
@@ -601,13 +592,13 @@ def test_to_python() -> None:
 def test_to_struct() -> None:
     s = pl.Series("nums", ["12 34", "56 78", "90 00"]).str.extract_all(r"\d+")
 
-    assert s.arr.to_struct().struct.fields == ["field_0", "field_1"]
-    assert s.arr.to_struct(fields=lambda idx: f"n{idx:02}").struct.fields == [
+    assert s.list.to_struct().struct.fields == ["field_0", "field_1"]
+    assert s.list.to_struct(fields=lambda idx: f"n{idx:02}").struct.fields == [
         "n00",
         "n01",
     ]
     assert_frame_equal(
-        s.arr.to_struct(fields=["one", "two"]).struct.unnest(),
+        s.list.to_struct(fields=["one", "two"]).struct.unnest(),
         pl.DataFrame({"one": ["12", "56", "90"], "two": ["34", "78", "00"]}),
     )
 
@@ -812,10 +803,15 @@ def test_get() -> None:
     neg_and_pos_idxs = pl.Series(
         "neg_and_pos_idxs", [-2, 1, 0, -1, 2, -3], dtype=pl.Int8
     )
+    empty_idxs = pl.Series("idxs", [], dtype=pl.Int8)
+    empty_ints: list[int] = []
     assert a[0] == 1
     assert a[:2].to_list() == [1, 2]
     assert a[range(1)].to_list() == [1]
     assert a[range(0, 4, 2)].to_list() == [1, 3]
+    assert a[:0].to_list() == []
+    assert a[empty_ints].to_list() == []
+    assert a[neg_and_pos_idxs.to_list()].to_list() == [2, 2, 1, 3, 3, 1]
     for dtype in (
         pl.UInt8,
         pl.UInt16,
@@ -828,6 +824,8 @@ def test_get() -> None:
     ):
         assert a[pos_idxs.cast(dtype)].to_list() == [3, 1, 2, 1]
         assert a[pos_idxs.cast(dtype).to_numpy()].to_list() == [3, 1, 2, 1]
+        assert a[empty_idxs.cast(dtype)].to_list() == []
+        assert a[empty_idxs.cast(dtype).to_numpy()].to_list() == []
 
     for dtype in (pl.Int8, pl.Int16, pl.Int32, pl.Int64):
         nps = a[neg_and_pos_idxs.cast(dtype).to_numpy()]
@@ -1029,6 +1027,9 @@ def test_rolling() -> None:
 
     assert a.rolling_std(2).to_list()[1] == pytest.approx(0.7071067811865476)
     assert a.rolling_var(2).to_list()[1] == pytest.approx(0.5)
+    assert a.rolling_std(2, ddof=0).to_list()[1] == pytest.approx(0.5)
+    assert a.rolling_var(2, ddof=0).to_list()[1] == pytest.approx(0.25)
+
     assert_series_equal(
         a.rolling_median(4), pl.Series("a", [None, None, None, 2, 2], dtype=Float64)
     )
@@ -1095,44 +1096,6 @@ def test_object() -> None:
     assert a.dtype == pl.Object
     assert a.to_list() == vals
     assert a[1] == "foo"
-
-
-def test_repeat() -> None:
-    s = pl.repeat(2**31 - 1, 3, eager=True)
-    assert s.dtype == pl.Int32
-    assert s.len() == 3
-    assert s.to_list() == [2**31 - 1] * 3
-    s = pl.repeat(-(2**31), 4, eager=True)
-    assert s.dtype == pl.Int32
-    assert s.len() == 4
-    assert s.to_list() == [-(2**31)] * 4
-    s = pl.repeat(2**31, 5, eager=True)
-    assert s.dtype == pl.Int64
-    assert s.len() == 5
-    assert s.to_list() == [2**31] * 5
-    s = pl.repeat(-(2**31) - 1, 3, eager=True)
-    assert s.dtype == pl.Int64
-    assert s.len() == 3
-    assert s.to_list() == [-(2**31) - 1] * 3
-    s = pl.repeat("foo", 2, eager=True)
-    assert s.dtype == pl.Utf8
-    assert s.len() == 2
-    assert s.to_list() == ["foo"] * 2
-    s = pl.repeat(1.0, 5, eager=True)
-    assert s.dtype == pl.Float64
-    assert s.len() == 5
-    assert s.to_list() == [1.0] * 5
-    s = pl.repeat(True, 4, eager=True)
-    assert s.dtype == pl.Boolean
-    assert s.len() == 4
-    assert s.to_list() == [True] * 4
-    s = pl.repeat(None, 7, eager=True)
-    assert s.dtype == pl.Null
-    assert s.len() == 7
-    assert s.to_list() == [None] * 7
-    s = pl.repeat(0, 0, eager=True)
-    assert s.dtype == pl.Int32
-    assert s.len() == 0
 
 
 def test_shape() -> None:
@@ -1267,36 +1230,6 @@ def test_slice() -> None:
         assert s[py_slice].to_list() == s.to_list()[py_slice]
 
 
-def test_arange_expr() -> None:
-    df = pl.DataFrame({"a": ["foobar", "barfoo"]})
-    out = df.select([pl.arange(0, pl.col("a").count() * 10)])
-    assert out.shape == (20, 1)
-    assert out.to_series(0)[-1] == 19
-
-    # eager arange
-    out2 = pl.arange(0, 10, 2, eager=True)
-    assert out2.to_list() == [0, 2, 4, 6, 8]
-
-    out3 = pl.arange(pl.Series([0, 19]), pl.Series([3, 39]), step=2, eager=True)
-    assert out3.dtype == pl.List
-    assert out3[0].to_list() == [0, 2]
-
-    df = pl.DataFrame({"start": [1, 2, 3, 5, 5, 5], "stop": [8, 3, 12, 8, 8, 8]})
-
-    assert df.select(pl.arange(pl.lit(1), pl.col("stop") + 1).alias("test")).to_dict(
-        False
-    ) == {
-        "test": [
-            [1, 2, 3, 4, 5, 6, 7, 8],
-            [1, 2, 3],
-            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
-            [1, 2, 3, 4, 5, 6, 7, 8],
-            [1, 2, 3, 4, 5, 6, 7, 8],
-            [1, 2, 3, 4, 5, 6, 7, 8],
-        ]
-    }
-
-
 def test_round() -> None:
     a = pl.Series("f", [1.003, 2.003])
     b = a.round(2)
@@ -1355,13 +1288,6 @@ def test_rank() -> None:
     )
 
 
-def test_rank_random() -> None:
-    s = pl.Series("a", [1, 2, 3, 2, 2, 3, 0])
-    assert_series_equal(
-        s.rank("random", seed=1), pl.Series("a", [2, 4, 7, 3, 5, 6, 1], dtype=UInt32)
-    )
-
-
 def test_diff() -> None:
     s = pl.Series("a", [1, 2, 3, 2, 2, 3, 0])
     expected = pl.Series("a", [1, 1, -1, 0, 1, -3])
@@ -1411,30 +1337,30 @@ def test_kurtosis() -> None:
 
 def test_arr_lengths() -> None:
     s = pl.Series("a", [[1, 2], [1, 2, 3]])
-    assert_series_equal(s.arr.lengths(), pl.Series("a", [2, 3], dtype=UInt32))
+    assert_series_equal(s.list.lengths(), pl.Series("a", [2, 3], dtype=UInt32))
     df = pl.DataFrame([s])
     assert_series_equal(
-        df.select(pl.col("a").arr.lengths())["a"], pl.Series("a", [2, 3], dtype=UInt32)
+        df.select(pl.col("a").list.lengths())["a"], pl.Series("a", [2, 3], dtype=UInt32)
     )
 
 
 def test_arr_arithmetic() -> None:
     s = pl.Series("a", [[1, 2], [1, 2, 3]])
-    assert_series_equal(s.arr.sum(), pl.Series("a", [3, 6]))
-    assert_series_equal(s.arr.mean(), pl.Series("a", [1.5, 2.0]))
-    assert_series_equal(s.arr.max(), pl.Series("a", [2, 3]))
-    assert_series_equal(s.arr.min(), pl.Series("a", [1, 1]))
+    assert_series_equal(s.list.sum(), pl.Series("a", [3, 6]))
+    assert_series_equal(s.list.mean(), pl.Series("a", [1.5, 2.0]))
+    assert_series_equal(s.list.max(), pl.Series("a", [2, 3]))
+    assert_series_equal(s.list.min(), pl.Series("a", [1, 1]))
 
 
 def test_arr_ordering() -> None:
     s = pl.Series("a", [[2, 1], [1, 3, 2]])
-    assert_series_equal(s.arr.sort(), pl.Series("a", [[1, 2], [1, 2, 3]]))
-    assert_series_equal(s.arr.reverse(), pl.Series("a", [[1, 2], [2, 3, 1]]))
+    assert_series_equal(s.list.sort(), pl.Series("a", [[1, 2], [1, 2, 3]]))
+    assert_series_equal(s.list.reverse(), pl.Series("a", [[1, 2], [2, 3, 1]]))
 
 
 def test_arr_unique() -> None:
     s = pl.Series("a", [[2, 1], [1, 2, 2]])
-    result = s.arr.unique()
+    result = s.list.unique()
     assert len(result) == 2
     assert sorted(result[0]) == [1, 2]
     assert sorted(result[1]) == [1, 2]
@@ -1477,27 +1403,6 @@ def test_strict_cast() -> None:
         pl.Series("a", [2**16]).cast(dtype=pl.Int16, strict=True)
     with pytest.raises(pl.ComputeError):
         pl.DataFrame({"a": [2**16]}).select([pl.col("a").cast(pl.Int16, strict=True)])
-
-
-def test_list_concat() -> None:
-    s0 = pl.Series("a", [[1, 2]])
-    s1 = pl.Series("b", [[3, 4, 5]])
-    expected = pl.Series("a", [[1, 2, 3, 4, 5]])
-
-    out = s0.arr.concat([s1])
-    assert_series_equal(out, expected)
-
-    out = s0.arr.concat(s1)
-    assert_series_equal(out, expected)
-
-    df = pl.DataFrame([s0, s1])
-    assert_series_equal(df.select(pl.concat_list(["a", "b"]).alias("a"))["a"], expected)
-    assert_series_equal(
-        df.select(pl.col("a").arr.concat("b").alias("a"))["a"], expected
-    )
-    assert_series_equal(
-        df.select(pl.col("a").arr.concat(["b"]).alias("a"))["a"], expected
-    )
 
 
 def test_floor_divide() -> None:
@@ -1903,21 +1808,6 @@ def test_dot() -> None:
         s1 @ [4, 5, 6, 7, 8]
 
 
-def test_sample() -> None:
-    s = pl.Series("a", [1, 2, 3, 4, 5])
-
-    assert len(s.sample(n=2, seed=0)) == 2
-    assert len(s.sample(fraction=0.4, seed=0)) == 2
-
-    assert len(s.sample(n=2, with_replacement=True, seed=0)) == 2
-
-    # on a series of length 5, you cannot sample more than 5 items
-    with pytest.raises(Exception):
-        s.sample(n=10, with_replacement=False, seed=0)
-    # unless you use with_replacement=True
-    assert len(s.sample(n=10, with_replacement=True, seed=0)) == 10
-
-
 def test_peak_max_peak_min() -> None:
     s = pl.Series("a", [4, 1, 3, 2, 5])
     result = s.peak_min()
@@ -2036,16 +1926,6 @@ def test_log_exp() -> None:
 
     expected = pl.Series("a", np.log1p(a.to_numpy()))
     assert_series_equal(a.log1p(), expected)
-
-
-def test_shuffle() -> None:
-    a = pl.Series("a", [1, 2, 3])
-    out = a.shuffle(2)
-    expected = pl.Series("a", [2, 1, 3])
-    assert_series_equal(out, expected)
-
-    out = pl.select(pl.lit(a).shuffle(2)).to_series()
-    assert_series_equal(out, expected)
 
 
 def test_to_physical() -> None:
@@ -2572,8 +2452,8 @@ def test_ptr() -> None:
 
 def test_null_comparisons() -> None:
     s = pl.Series("s", [None, "str", "a"])
-    assert (s.shift() == s).null_count() == 0
-    assert (s.shift() != s).null_count() == 0
+    assert (s.shift() == s).null_count() == 2
+    assert (s.shift() != s).null_count() == 2
 
 
 def test_min_max_agg_on_str() -> None:

@@ -63,13 +63,6 @@ impl<T: PolarsObject> ChunkUnique<ObjectType<T>> for ObjectChunked<T> {
     }
 }
 
-fn fill_set<A>(a: impl Iterator<Item = A>) -> PlHashSet<A>
-where
-    A: Hash + Eq,
-{
-    a.collect()
-}
-
 fn arg_unique<T>(a: impl Iterator<Item = T>, capacity: usize) -> Vec<IdxSize>
 where
     T: Hash + Eq,
@@ -139,7 +132,6 @@ where
         }
         match self.is_sorted_flag() {
             IsSorted::Ascending | IsSorted::Descending => {
-                // TODO! optimize this branch
                 if self.null_count() > 0 {
                     let mut arr = MutablePrimitiveArray::with_capacity(self.len());
                     let mut iter = self.into_iter();
@@ -170,7 +162,7 @@ where
                         ))
                     }
                 } else {
-                    let mask = self.not_equal(&self.shift(1));
+                    let mask = self.not_equal_and_validity(&self.shift(1));
                     self.filter(&mask)
                 }
             }
@@ -186,10 +178,39 @@ where
     }
 
     fn n_unique(&self) -> PolarsResult<usize> {
-        if self.null_count() > 0 {
-            Ok(fill_set(self.into_iter().flatten()).len() + 1)
-        } else {
-            Ok(fill_set(self.into_no_null_iter()).len())
+        // prevent stackoverflow repeated sorted.unique call
+        if self.is_empty() {
+            return Ok(0);
+        }
+        match self.is_sorted_flag() {
+            IsSorted::Ascending | IsSorted::Descending => {
+                if self.null_count() > 0 {
+                    let mut count = 0;
+                    let mut iter = self.into_iter();
+                    let mut last = None;
+
+                    if let Some(val) = iter.next() {
+                        last = val;
+                        count += 1;
+                    };
+
+                    iter.for_each(|opt_val| {
+                        if opt_val != last {
+                            last = opt_val;
+                            count += 1;
+                        }
+                    });
+
+                    Ok(count)
+                } else {
+                    let mask = self.not_equal_and_validity(&self.shift(1));
+                    Ok(mask.sum().unwrap() as usize)
+                }
+            }
+            IsSorted::Not => {
+                let sorted = self.sort(false);
+                sorted.n_unique()
+            }
         }
     }
 
@@ -253,10 +274,17 @@ impl ChunkUnique<BinaryType> for BinaryChunked {
     }
 
     fn n_unique(&self) -> PolarsResult<usize> {
+        let mut set: PlHashSet<&[u8]> = PlHashSet::new();
         if self.null_count() > 0 {
-            Ok(fill_set(self.into_iter().flatten()).len() + 1)
+            for arr in self.downcast_iter() {
+                set.extend(arr.into_iter().flatten())
+            }
+            Ok(set.len() + 1)
         } else {
-            Ok(fill_set(self.into_no_null_iter()).len())
+            for arr in self.downcast_iter() {
+                set.extend(arr.values_iter())
+            }
+            Ok(set.len())
         }
     }
 

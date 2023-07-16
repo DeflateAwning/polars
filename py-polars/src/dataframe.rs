@@ -13,7 +13,7 @@ use polars::prelude::*;
 use polars_core::export::arrow::datatypes::IntegerType;
 use polars_core::frame::explode::MeltArgs;
 use polars_core::frame::*;
-use polars_core::prelude::QuantileInterpolOptions;
+use polars_core::prelude::{IndexOrder, QuantileInterpolOptions};
 use polars_core::utils::arrow::compute::cast::CastOptions;
 use polars_core::utils::try_get_supertype;
 #[cfg(feature = "pivot")]
@@ -31,7 +31,7 @@ use crate::conversion::{ObjectValue, Wrap};
 use crate::error::PyPolarsErr;
 use crate::file::{get_either_file, get_file_like, get_mmap_bytes_reader, EitherRustPythonFile};
 use crate::prelude::{dicts_to_rows, strings_to_smartstrings};
-use crate::series::{to_pyseries_collection, to_series_collection, PySeries};
+use crate::series::{PySeries, ToPySeries, ToSeries};
 use crate::{arrow_interop, py_modules, PyExpr, PyLazyFrame};
 
 #[pyclass]
@@ -113,7 +113,7 @@ impl PyDataFrame {
 
     #[new]
     pub fn __init__(columns: Vec<PySeries>) -> PyResult<Self> {
-        let columns = to_series_collection(columns);
+        let columns = columns.to_series();
         let df = DataFrame::new(columns).map_err(PyPolarsErr::from)?;
         Ok(PyDataFrame::new(df))
     }
@@ -351,29 +351,43 @@ impl PyDataFrame {
 
     #[staticmethod]
     #[cfg(feature = "json")]
-    pub fn read_json(py_f: &PyAny, json_lines: bool) -> PyResult<Self> {
+    pub fn read_json(
+        py_f: &PyAny,
+        schema: Option<Wrap<Schema>>,
+        schema_overrides: Option<Wrap<Schema>>,
+    ) -> PyResult<Self> {
+        // memmap the file first
         let mmap_bytes_r = get_mmap_bytes_reader(py_f)?;
-        if json_lines {
-            let out = JsonReader::new(mmap_bytes_r)
-                .with_json_format(JsonFormat::JsonLines)
-                .finish()
-                .map_err(|e| PyPolarsErr::Other(format!("{e}")))?;
-            Ok(out.into())
-        } else {
-            // memmap the file first
-            let mmap_bytes_r = get_mmap_bytes_reader(py_f)?;
-            let mmap_read: ReaderBytes = (&mmap_bytes_r).into();
-            let bytes = mmap_read.deref();
+        let mmap_read: ReaderBytes = (&mmap_bytes_r).into();
+        let bytes = mmap_read.deref();
 
-            // Happy path is our column oriented json as that is most performant
-            // on failure we try
-            match serde_json::from_slice::<DataFrame>(bytes) {
-                Ok(df) => Ok(df.into()),
+        // Happy path is our column oriented json as that is most performant
+        // on failure we try
+        match serde_json::from_slice::<DataFrame>(bytes) {
+            Ok(df) => Ok(df.into()),
+            Err(e) => {
+                let msg = format!("{e}");
+                // parsing succeeded, but the dataframe was invalid
+                if msg.contains("successful parse invalid data") {
+                    let e = PyPolarsErr::from(PolarsError::ComputeError(msg.into()));
+                    Err(PyErr::from(e))
+                }
+                // parsing error
                 // try arrow json reader instead
                 // this is row oriented
-                Err(_) => {
-                    let out = JsonReader::new(mmap_bytes_r)
-                        .with_json_format(JsonFormat::Json)
+                else {
+                    let mut builder =
+                        JsonReader::new(mmap_bytes_r).with_json_format(JsonFormat::Json);
+
+                    if let Some(schema) = schema {
+                        builder = builder.with_schema(Arc::new(schema.0));
+                    }
+
+                    if let Some(schema) = schema_overrides.as_ref() {
+                        builder = builder.with_schema_overwrite(&schema.0);
+                    }
+
+                    let out = builder
                         .finish()
                         .map_err(|e| PyPolarsErr::Other(format!("{e}")))?;
                     Ok(out.into())
@@ -384,11 +398,27 @@ impl PyDataFrame {
 
     #[staticmethod]
     #[cfg(feature = "json")]
-    pub fn read_ndjson(py_f: &PyAny) -> PyResult<Self> {
+    pub fn read_ndjson(
+        py_f: &PyAny,
+        ignore_errors: bool,
+        schema: Option<Wrap<Schema>>,
+        schema_overrides: Option<Wrap<Schema>>,
+    ) -> PyResult<Self> {
         let mmap_bytes_r = get_mmap_bytes_reader(py_f)?;
 
-        let out = JsonReader::new(mmap_bytes_r)
+        let mut builder = JsonReader::new(mmap_bytes_r)
             .with_json_format(JsonFormat::JsonLines)
+            .with_ignore_errors(ignore_errors);
+
+        if let Some(schema) = schema {
+            builder = builder.with_schema(Arc::new(schema.0));
+        }
+
+        if let Some(schema) = schema_overrides.as_ref() {
+            builder = builder.with_schema_overwrite(&schema.0);
+        }
+
+        let out = builder
             .finish()
             .map_err(|e| PyPolarsErr::Other(format!("{e}")))?;
         Ok(out.into())
@@ -490,7 +520,7 @@ impl PyDataFrame {
             .map(|(key, val)| {
                 let name = key.extract::<&str>()?;
 
-                let s = if val.is_instance_of::<PyDict>()? {
+                let s = if val.is_instance_of::<PyDict>() {
                     let df = Self::read_dict(py, val.extract::<&PyDict>()?)?;
                     df.df.into_struct(name).into_series()
                 } else {
@@ -639,7 +669,7 @@ impl PyDataFrame {
         })
     }
 
-    pub fn to_numpy(&self, py: Python) -> Option<PyObject> {
+    pub fn to_numpy(&self, py: Python, order: Wrap<IndexOrder>) -> Option<PyObject> {
         let mut st = None;
         for s in self.df.iter() {
             let dt_i = s.dtype();
@@ -655,32 +685,32 @@ impl PyDataFrame {
         match st {
             DataType::UInt32 => self
                 .df
-                .to_ndarray::<UInt32Type>()
+                .to_ndarray::<UInt32Type>(order.0)
                 .ok()
                 .map(|arr| arr.into_pyarray(py).into_py(py)),
             DataType::UInt64 => self
                 .df
-                .to_ndarray::<UInt64Type>()
+                .to_ndarray::<UInt64Type>(order.0)
                 .ok()
                 .map(|arr| arr.into_pyarray(py).into_py(py)),
             DataType::Int32 => self
                 .df
-                .to_ndarray::<Int32Type>()
+                .to_ndarray::<Int32Type>(order.0)
                 .ok()
                 .map(|arr| arr.into_pyarray(py).into_py(py)),
             DataType::Int64 => self
                 .df
-                .to_ndarray::<Int64Type>()
+                .to_ndarray::<Int64Type>(order.0)
                 .ok()
                 .map(|arr| arr.into_pyarray(py).into_py(py)),
             DataType::Float32 => self
                 .df
-                .to_ndarray::<Float32Type>()
+                .to_ndarray::<Float32Type>(order.0)
                 .ok()
                 .map(|arr| arr.into_pyarray(py).into_py(py)),
             DataType::Float64 => self
                 .df
-                .to_ndarray::<Float64Type>()
+                .to_ndarray::<Float64Type>(order.0)
                 .ok()
                 .map(|arr| arr.into_pyarray(py).into_py(py)),
             _ => None,
@@ -724,7 +754,7 @@ impl PyDataFrame {
     }
 
     pub fn to_arrow(&mut self) -> PyResult<Vec<PyObject>> {
-        self.df.rechunk();
+        self.df.align_chunks();
         Python::with_gil(|py| {
             let pyarrow = py.import("pyarrow")?;
             let names = self.df.get_column_names();
@@ -869,7 +899,7 @@ impl PyDataFrame {
 
     pub fn get_columns(&self) -> Vec<PySeries> {
         let cols = self.df.get_columns().to_vec();
-        to_pyseries_collection(cols)
+        cols.to_pyseries()
     }
 
     /// Get column names
@@ -910,31 +940,31 @@ impl PyDataFrame {
         self.df.width()
     }
 
-    pub fn hstack_mut(&mut self, columns: Vec<PySeries>) -> PyResult<()> {
-        let columns = to_series_collection(columns);
-        self.df.hstack_mut(&columns).map_err(PyPolarsErr::from)?;
-        Ok(())
-    }
-
     pub fn hstack(&self, columns: Vec<PySeries>) -> PyResult<Self> {
-        let columns = to_series_collection(columns);
+        let columns = columns.to_series();
         let df = self.df.hstack(&columns).map_err(PyPolarsErr::from)?;
         Ok(df.into())
     }
 
-    pub fn extend(&mut self, df: &PyDataFrame) -> PyResult<()> {
-        self.df.extend(&df.df).map_err(PyPolarsErr::from)?;
+    pub fn hstack_mut(&mut self, columns: Vec<PySeries>) -> PyResult<()> {
+        let columns = columns.to_series();
+        self.df.hstack_mut(&columns).map_err(PyPolarsErr::from)?;
         Ok(())
     }
 
-    pub fn vstack_mut(&mut self, df: &PyDataFrame) -> PyResult<()> {
-        self.df.vstack_mut(&df.df).map_err(PyPolarsErr::from)?;
-        Ok(())
-    }
-
-    pub fn vstack(&mut self, df: &PyDataFrame) -> PyResult<Self> {
-        let df = self.df.vstack(&df.df).map_err(PyPolarsErr::from)?;
+    pub fn vstack(&self, other: &PyDataFrame) -> PyResult<Self> {
+        let df = self.df.vstack(&other.df).map_err(PyPolarsErr::from)?;
         Ok(df.into())
+    }
+
+    pub fn vstack_mut(&mut self, other: &PyDataFrame) -> PyResult<()> {
+        self.df.vstack_mut(&other.df).map_err(PyPolarsErr::from)?;
+        Ok(())
+    }
+
+    pub fn extend(&mut self, other: &PyDataFrame) -> PyResult<()> {
+        self.df.extend(&other.df).map_err(PyPolarsErr::from)?;
+        Ok(())
     }
 
     pub fn drop_in_place(&mut self, name: &str) -> PyResult<PySeries> {
@@ -1146,11 +1176,16 @@ impl PyDataFrame {
         Ok(PyDataFrame::new(df))
     }
 
-    pub fn partition_by(&self, by: Vec<String>, maintain_order: bool) -> PyResult<Vec<Self>> {
+    pub fn partition_by(
+        &self,
+        by: Vec<String>,
+        maintain_order: bool,
+        include_key: bool,
+    ) -> PyResult<Vec<Self>> {
         let out = if maintain_order {
-            self.df.partition_by_stable(by)
+            self.df.partition_by_stable(by, include_key)
         } else {
-            self.df.partition_by(by)
+            self.df.partition_by(by, include_key)
         }
         .map_err(PyPolarsErr::from)?;
         // Safety:
@@ -1226,16 +1261,20 @@ impl PyDataFrame {
         Ok(df.into())
     }
 
+    #[pyo3(signature = (columns, separator, drop_first=false))]
     pub fn to_dummies(
         &self,
         columns: Option<Vec<String>>,
         separator: Option<&str>,
+        drop_first: bool,
     ) -> PyResult<Self> {
         let df = match columns {
-            Some(cols) => self
-                .df
-                .columns_to_dummies(cols.iter().map(|x| x as &str).collect(), separator),
-            None => self.df.to_dummies(separator),
+            Some(cols) => self.df.columns_to_dummies(
+                cols.iter().map(|x| x as &str).collect(),
+                separator,
+                drop_first,
+            ),
+            None => self.df.to_dummies(separator, drop_first),
         }
         .map_err(PyPolarsErr::from)?;
         Ok(df.into())
@@ -1248,12 +1287,14 @@ impl PyDataFrame {
 
     #[pyo3(signature = (lambda, output_type, inference_size))]
     pub fn apply(
-        &self,
+        &mut self,
         lambda: &PyAny,
         output_type: Option<Wrap<DataType>>,
         inference_size: usize,
     ) -> PyResult<(PyObject, bool)> {
         Python::with_gil(|py| {
+            // needed for series iter
+            self.df.as_single_chunk_par();
             let df = &self.df;
 
             let output_type = output_type.map(|dt| dt.0);

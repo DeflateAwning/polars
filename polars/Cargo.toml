@@ -14,7 +14,7 @@ sql = ["polars-sql"]
 rows = ["polars-core/rows"]
 simd = ["polars-core/simd", "polars-io/simd", "polars-ops/simd"]
 avx512 = ["polars-core/avx512"]
-nightly = ["polars-core/nightly", "polars-ops/nightly", "simd"]
+nightly = ["polars-core/nightly", "polars-ops/nightly", "simd", "polars-lazy/nightly"]
 docs = ["polars-core/docs"]
 temporal = ["polars-core/temporal", "polars-lazy/temporal", "polars-io/temporal", "polars-time"]
 random = ["polars-core/random", "polars-lazy/random"]
@@ -43,10 +43,10 @@ lazy = ["polars-core/lazy", "polars-lazy", "polars-lazy/compile"]
 strings = ["polars-core/strings", "polars-lazy/strings", "polars-ops/strings"]
 
 # support for ObjectChunked<T> (downcastable Series of any type)
-object = ["polars-core/object", "polars-lazy/object"]
+object = ["polars-core/object", "polars-lazy/object", "polars-io/object"]
 
 # support for arrows json parsing
-json = ["polars-io", "polars-io/json", "polars-lazy/json", "polars-sql/json"]
+json = ["polars-io", "polars-io/json", "polars-lazy/json", "polars-sql/json", "dtype-struct"]
 
 # support for arrows ipc file parsing
 ipc = ["polars-io", "polars-io/ipc", "polars-lazy/ipc", "polars-sql/ipc"]
@@ -100,7 +100,12 @@ decompress = ["polars-io/decompress"]
 decompress-fast = ["polars-io/decompress-fast"]
 mode = ["polars-core/mode", "polars-lazy/mode"]
 take_opt_iter = ["polars-core/take_opt_iter"]
-extract_jsonpath = ["polars-core/strings", "polars-ops/extract_jsonpath", "polars-ops/strings"]
+extract_jsonpath = [
+  "polars-core/strings",
+  "polars-ops/extract_jsonpath",
+  "polars-ops/strings",
+  "polars-lazy/extract_jsonpath",
+]
 string_encoding = ["polars-ops/string_encoding", "polars-core/strings"]
 binary_encoding = ["polars-ops/binary_encoding"]
 groupby_list = ["polars-core/groupby_list"]
@@ -112,7 +117,7 @@ rank = ["polars-core/rank", "polars-lazy/rank"]
 diff = ["polars-core/diff", "polars-lazy/diff", "polars-ops/diff"]
 pct_change = ["polars-core/pct_change", "polars-lazy/pct_change"]
 moment = ["polars-core/moment", "polars-lazy/moment", "polars-ops/moment"]
-arange = ["polars-lazy/arange"]
+range = ["polars-lazy/range"]
 true_div = ["polars-lazy/true_div"]
 diagonal_concat = ["polars-core/diagonal_concat", "polars-lazy/diagonal_concat"]
 horizontal_concat = ["polars-core/horizontal_concat"]
@@ -153,10 +158,13 @@ propagate_nans = ["polars-lazy/propagate_nans"]
 coalesce = ["polars-lazy/coalesce"]
 streaming = ["polars-lazy/streaming"]
 fused = ["polars-ops/fused", "polars-lazy/fused"]
+list_sets = ["polars-lazy/list_sets"]
+list_any_all = ["polars-lazy/list_any_all"]
+cutqcut = ["polars-lazy/cutqcut"]
+rle = ["polars-lazy/rle"]
 
 test = [
   "lazy",
-  "private",
   "rolling_window",
   "rank",
   "round_series",
@@ -172,15 +180,13 @@ test = [
   "json",
 ]
 
-# don't use this
-private = ["polars-lazy/private", "polars-core/private", "polars-time/private", "polars-sql/private"]
-
 # all opt-in datatypes
 dtype-full = [
   "dtype-date",
   "dtype-datetime",
   "dtype-duration",
   "dtype-time",
+  "dtype-array",
   "dtype-i8",
   "dtype-i16",
   "dtype-decimal",
@@ -221,9 +227,19 @@ dtype-duration = [
   "polars-ops/dtype-duration",
 ]
 dtype-time = ["polars-core/dtype-time", "polars-io/dtype-time", "polars-time/dtype-time", "polars-ops/dtype-time"]
+dtype-array = [
+  "polars-core/dtype-array",
+  "polars-lazy/dtype-array",
+  "polars-ops/dtype-array",
+]
 dtype-i8 = ["polars-core/dtype-i8", "polars-lazy/dtype-i8", "polars-ops/dtype-i8"]
 dtype-i16 = ["polars-core/dtype-i16", "polars-lazy/dtype-i16", "polars-ops/dtype-i16"]
-dtype-decimal = ["polars-core/dtype-decimal", "polars-lazy/dtype-decimal", "polars-ops/dtype-decimal"]
+dtype-decimal = [
+  "polars-core/dtype-decimal",
+  "polars-lazy/dtype-decimal",
+  "polars-ops/dtype-decimal",
+  "polars-io/dtype-decimal",
+]
 dtype-u8 = ["polars-core/dtype-u8", "polars-lazy/dtype-u8", "polars-ops/dtype-u8"]
 dtype-u16 = ["polars-core/dtype-u16", "polars-lazy/dtype-u16", "polars-ops/dtype-u16"]
 dtype-categorical = [
@@ -273,7 +289,7 @@ docs-selection = [
   "interpolate",
   "diff",
   "rank",
-  "arange",
+  "range",
   "diagonal_concat",
   "horizontal_concat",
   "abs",
@@ -296,13 +312,13 @@ bench = [
 ]
 
 [dependencies]
-polars-algo = { version = "0.28.0", path = "./polars-algo", optional = true }
-polars-core = { version = "0.28.0", path = "./polars-core", features = ["docs", "private"], default-features = false }
-polars-io = { version = "0.28.0", path = "./polars-io", features = ["private"], default-features = false, optional = true }
-polars-lazy = { version = "0.28.0", path = "./polars-lazy", features = ["private"], default-features = false, optional = true }
-polars-ops = { version = "0.28.0", path = "./polars-ops" }
-polars-sql = { version = "0.28.0", path = "./polars-sql", default-features = false, optional = true }
-polars-time = { version = "0.28.0", path = "./polars-time", default-features = false, optional = true }
+polars-algo = { version = "0.31.1", path = "./polars-algo", optional = true }
+polars-core = { version = "0.31.1", path = "./polars-core", features = ["docs"], default-features = false }
+polars-io = { version = "0.31.1", path = "./polars-io", features = [], default-features = false, optional = true }
+polars-lazy = { version = "0.31.1", path = "./polars-lazy", features = [], default-features = false, optional = true }
+polars-ops = { version = "0.31.1", path = "./polars-ops" }
+polars-sql = { version = "0.31.1", path = "./polars-sql", default-features = false, optional = true }
+polars-time = { version = "0.31.1", path = "./polars-time", default-features = false, optional = true }
 
 # enable js feature for getrandom to work in wasm
 [target.'cfg(target_family = "wasm")'.dependencies.getrandom]

@@ -108,7 +108,8 @@ fn test_cast_exprs() {
             cast(a as FLOAT) as floats,
             cast(a as INT) as ints,
             cast(a as BIGINT) as bigints,
-            cast(a as STRING) as strings
+            cast(a as STRING) as strings,
+            cast(a as BLOB) as binary
         FROM df"#;
     let df_sql = context.execute(sql).unwrap().collect().unwrap();
     let df_pl = df
@@ -118,6 +119,7 @@ fn test_cast_exprs() {
             col("a").cast(DataType::Int32).alias("ints"),
             col("a").cast(DataType::Int64).alias("bigints"),
             col("a").cast(DataType::Utf8).alias("strings"),
+            col("a").cast(DataType::Binary).alias("binary"),
         ])
         .collect()
         .unwrap();
@@ -494,9 +496,60 @@ fn test_groupby_2() -> PolarsResult<()> {
             vec![col("count"), col("category")],
             vec![false, true],
             false,
+            false,
         )
         .limit(2);
     let expected = expected.collect()?;
     assert!(df_sql.frame_equal(&expected));
     Ok(())
+}
+
+#[test]
+fn test_case_expr() {
+    let df = create_sample_df().unwrap().head(Some(10));
+    let mut context = SQLContext::new();
+    context.register("df", df.clone().lazy());
+    let sql = r#"
+        SELECT
+            CASE
+                WHEN (a > 5 AND a < 8) THEN 'gt_5 and lt_8'
+                WHEN a <= 5 THEN 'lteq_5'
+                ELSE 'no match'
+            END AS sign
+        FROM df"#;
+    let df_sql = context.execute(sql).unwrap().collect().unwrap();
+    let case_expr = when(col("a").gt(lit(5)).and(col("a").lt(lit(8))))
+        .then(lit("gt_5 and lt_8"))
+        .when(col("a").lt_eq(lit(5)))
+        .then(lit("lteq_5"))
+        .otherwise(lit("no match"))
+        .alias("sign");
+    let df_pl = df.lazy().select(&[case_expr]).collect().unwrap();
+    assert!(df_sql.frame_equal(&df_pl));
+}
+
+#[test]
+fn test_sql_expr() {
+    let df = create_sample_df().unwrap();
+    let expr = sql_expr("MIN(a)").unwrap();
+    let actual = df.clone().lazy().select(&[expr]).collect().unwrap();
+    let expected = df.lazy().select(&[col("a").min()]).collect().unwrap();
+    assert!(actual.frame_equal(&expected));
+}
+
+#[test]
+fn test_iss_9471() {
+    let sql = r#"
+    SELECT
+        ABS(a,a,a,a,1,2,3,XYZRandomLetters,"XYZRandomLetters") as "abs",
+    FROM df"#;
+    let df = df! {
+        "a" => [-4, -3, -2, -1, 0, 1, 2, 3, 4],
+    }
+    .unwrap()
+    .lazy();
+    let mut context = SQLContext::new();
+    context.register("df", df);
+    let res = context.execute(sql);
+    assert!(res.is_err())
 }

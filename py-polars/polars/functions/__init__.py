@@ -1,38 +1,46 @@
-from polars.functions.eager import (
-    align_frames,
-    concat,
-    cut,
-    date_range,
-    get_dummies,
-    ones,
-    zeros,
-)
-from polars.functions.lazy import (
+from polars.functions.aggregation import (
     all,
+    all_horizontal,
     any,
+    any_horizontal,
+    cumsum,
+    cumsum_horizontal,
+    max,
+    max_horizontal,
+    min,
+    min_horizontal,
+    sum,
+    sum_horizontal,
+)
+from polars.functions.as_datatype import (
+    concat_list,
+    concat_str,
+    duration,
+    format,
+    struct,
+)
+from polars.functions.as_datatype import date_ as date
+from polars.functions.as_datatype import datetime_ as datetime
+from polars.functions.as_datatype import time_ as time
+from polars.functions.eager import align_frames, concat
+from polars.functions.lazy import (
     apply,
     approx_unique,
-    arange,
     arg_sort_by,
     arg_where,
     avg,
     coalesce,
     col,
     collect_all,
-    concat_list,
-    concat_str,
     corr,
     count,
     cov,
     cumfold,
     cumreduce,
-    cumsum,
-    duration,
     element,
     exclude,
     first,
     fold,
-    format,
     from_epoch,
     groups,
     head,
@@ -40,46 +48,49 @@ from polars.functions.lazy import (
     last,
     lit,
     map,
-    max,
     mean,
     median,
-    min,
     n_unique,
-    pearson_corr,
     quantile,
     reduce,
-    repeat,
     rolling_corr,
     rolling_cov,
     select,
-    spearman_rank_corr,
+    sql_expr,
     std,
-    struct,
-    sum,
     tail,
     var,
 )
-from polars.functions.lazy import date_ as date
-from polars.functions.lazy import datetime_ as datetime
-from polars.functions.lazy import list_ as list
+from polars.functions.range import arange, date_range, int_range, int_ranges, time_range
+from polars.functions.repeat import ones, repeat, zeros
 from polars.functions.whenthen import when
 
 __all__ = [
+    # polars.functions.aggregation
+    "all",
+    "any",
+    "cumsum",
+    "max",
+    "min",
+    "sum",
+    "all_horizontal",
+    "any_horizontal",
+    "cumsum_horizontal",
+    "max_horizontal",
+    "min_horizontal",
+    "sum_horizontal",
     # polars.functions.eager
     "align_frames",
     "approx_unique",
     "arg_where",
     "concat",
-    "cut",
     "date_range",
     "element",
-    "get_dummies",
     "ones",
     "repeat",
+    "time_range",
     "zeros",
     # polars.functions.lazy
-    "all",
-    "any",
     "apply",
     "arange",
     "arg_sort_by",
@@ -94,7 +105,6 @@ __all__ = [
     "cov",
     "cumfold",
     "cumreduce",
-    "cumsum",
     "date",  # named date_, see import above
     "datetime",  # named datetime_, see import above
     "duration",
@@ -106,27 +116,25 @@ __all__ = [
     "groups",
     "head",
     "implode",
+    "int_range",
+    "int_ranges",
     "last",
-    "list",  # named list_, see import above
     "lit",
     "map",
-    "max",
     "mean",
     "median",
-    "min",
     "n_unique",
-    "pearson_corr",
     "quantile",
     "reduce",
     "rolling_corr",
     "rolling_cov",
     "select",
-    "spearman_rank_corr",
     "std",
     "struct",
-    "sum",
     "tail",
+    "time",
     "var",
     # polars.functions.whenthen
     "when",
+    "sql_expr",
 ]

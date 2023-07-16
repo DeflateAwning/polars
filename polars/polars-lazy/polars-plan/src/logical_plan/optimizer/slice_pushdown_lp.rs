@@ -1,7 +1,6 @@
 use polars_core::prelude::*;
 
 use crate::prelude::*;
-use crate::utils::aexpr_is_simple_projection;
 
 pub(super) struct SlicePushDown {
     streaming: bool,
@@ -137,73 +136,49 @@ impl SlicePushDown {
                 };
                 Ok(lp)
             }
-
-            #[cfg(feature = "parquet")]
-            (ParquetScan {
-                path,
-                file_info,
-                output_schema,
-                predicate,
-                mut options,
-                cloud_options,
-
-            },
-                // TODO! we currently skip slice pushdown if there is a predicate.
-                // we can modify the readers to only limit after predicates have been applied
-                Some(state)) if state.offset == 0 && predicate.is_none() => {
-                options.n_rows = Some(state.len as usize);
-                let lp = ParquetScan {
-                    path,
-                    file_info,
-                    output_schema,
-                    predicate,
-                    options,
-                    cloud_options,
-                };
-
-                Ok(lp)
-            },
-            #[cfg(feature = "ipc")]
-            (IpcScan {path,
-            file_info,
-                output_schema,
-                predicate,
-                mut options
-            }, Some(state)) if state.offset == 0 && predicate.is_none() => {
-                options.n_rows = Some(state.len as usize);
-                let lp = IpcScan {
-                    path,
-                    file_info,
-                    output_schema,
-                    predicate,
-                    options
-                };
-
-                Ok(lp)
-
-            }
-
             #[cfg(feature = "csv")]
-            (CsvScan {
+            (Scan {
                 path,
                 file_info,
                 output_schema,
-                mut options,
+                file_options: mut options,
                 predicate,
-            }, Some(state)) if state.offset >= 0 && predicate.is_none() => {
-                options.skip_rows += state.offset as usize;
+                scan_type: FileScan::Csv {options: mut csv_options}
+            }, Some(state)) if predicate.is_none() && state.offset >= 0 =>  {
                 options.n_rows = Some(state.len as usize);
+                csv_options.skip_rows += state.offset as usize;
 
-                let lp = CsvScan {
+                let lp = Scan {
                     path,
                     file_info,
                     output_schema,
-                    options,
+                    scan_type: FileScan::Csv {options: csv_options},
+                    file_options: options,
                     predicate,
                 };
                 Ok(lp)
-            }
+            },
+            (Scan {
+                path,
+                file_info,
+                output_schema,
+                file_options: mut options,
+                predicate,
+                scan_type
+            }, Some(state)) if state.offset == 0 && predicate.is_none() => {
 
+                options.n_rows = Some(state.len as usize);
+                let lp = Scan {
+                    path,
+                    file_info,
+                    output_schema,
+                    predicate,
+                    file_options: options,
+                    scan_type
+                };
+
+                Ok(lp)
+            }
             (Union {inputs, mut options }, Some(state)) => {
                 options.slice = Some((state.offset, state.len as usize));
                 Ok(Union {inputs, options})
@@ -227,7 +202,7 @@ impl SlicePushDown {
 
                 // then assign the slice state to the join operation
 
-                options.slice = Some((state.offset, state.len as usize));
+                options.args.slice = Some((state.offset, state.len as usize));
 
                 Ok(Join {
                     input_left,
@@ -351,29 +326,18 @@ impl SlicePushDown {
                 self.pushdown_and_continue(lp, state, lp_arena, expr_arena)
             }
             // there is state, inspect the projection to determine how to deal with it
-            (Projection {input, mut expr, schema}, Some(State{offset, len})) => {
+            (Projection {input, expr, schema}, Some(_)) => {
                 // The slice operation may only pass on simple projections. col("foo").alias("bar")
                 if expr.iter().all(|root|  {
-                    aexpr_is_simple_projection(*root, expr_arena)
+                    aexpr_is_elementwise(*root, expr_arena)
                 }) {
                     let lp = Projection {input, expr, schema};
                     self.pushdown_and_continue(lp, state, lp_arena, expr_arena)
                 }
-                // we add a slice node to the projections
+                // don't push down slice, but restart optimization
                 else {
-                    let offset_node = to_aexpr(lit(offset), expr_arena);
-                    let length_node = to_aexpr(lit(len), expr_arena);
-                    expr.iter_mut().for_each(|node| {
-                        let aexpr = AExpr::Slice {
-                            input: *node,
-                            offset: offset_node,
-                            length: length_node
-                        };
-                        *node = expr_arena.add(aexpr)
-                    });
                     let lp = Projection {input, expr, schema};
-
-                    self.pushdown_and_continue(lp, None, lp_arena, expr_arena)
+                    self.no_pushdown_restart_opt(lp, state, lp_arena, expr_arena)
                 }
             }
             (catch_all, state) => {

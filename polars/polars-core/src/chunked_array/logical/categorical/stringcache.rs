@@ -6,7 +6,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use ahash::RandomState;
 use hashbrown::hash_map::RawEntryMut;
 use once_cell::sync::Lazy;
-use polars_utils::HashSingle;
 use smartstring::{LazyCompact, SmartString};
 
 use crate::datatypes::PlIdHashMap;
@@ -19,6 +18,15 @@ use crate::prelude::InitHashMaps;
 pub(crate) static USE_STRING_CACHE: AtomicU32 = AtomicU32::new(0);
 
 /// RAII for the string cache
+/// If an operation creates categoricals and uses them in a join
+/// or comparison that operation must hold this cache via
+/// `let handle = IUseStringCache::hold()`
+/// The cache is valid until `handle` is dropped.
+///
+/// # De-allocation
+/// Multiple threads can hold the string cache at the same time.
+/// The contents of the cache will only get dropped when no
+/// thread holds it.
 pub struct IUseStringCache {
     // only added so that it will never be constructed directly
     #[allow(dead_code)]
@@ -27,13 +35,13 @@ pub struct IUseStringCache {
 
 impl Default for IUseStringCache {
     fn default() -> Self {
-        Self::new()
+        Self::hold()
     }
 }
 
 impl IUseStringCache {
     /// Hold the StringCache
-    pub fn new() -> IUseStringCache {
+    pub fn hold() -> IUseStringCache {
         enable_string_cache(true);
         IUseStringCache { private_zst: () }
     }
@@ -147,7 +155,7 @@ impl SCacheInner {
 
     #[inline]
     pub(crate) fn get_cat(&self, s: &str) -> Option<u32> {
-        let h = StringCache::get_hash_builder().hash_single(s);
+        let h = StringCache::get_hash_builder().hash_one(s);
         // as StrHashGlobal may allocate a string
         self.map
             .raw_entry()
@@ -163,7 +171,7 @@ impl SCacheInner {
 
     #[inline]
     pub(crate) fn insert(&mut self, s: &str) -> u32 {
-        let h = StringCache::get_hash_builder().hash_single(s);
+        let h = StringCache::get_hash_builder().hash_one(s);
         self.insert_from_hash(h, s)
     }
 }

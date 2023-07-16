@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import warnings
 from typing import TYPE_CHECKING
 
 from polars import functions as F
 from polars.series.utils import expr_dispatch
-from polars.utils import no_default
 from polars.utils._wrap import wrap_s
 from polars.utils.decorators import deprecated_alias
+from polars.utils.various import find_stacklevel
 
 if TYPE_CHECKING:
     from polars import Expr, Series
@@ -17,7 +18,6 @@ if TYPE_CHECKING:
         TimeUnit,
         TransferEncoding,
     )
-    from polars.utils import NoDefault
 
 
 @expr_dispatch
@@ -52,6 +52,10 @@ class StringNameSpace:
         exact
             Require an exact format match. If False, allow the format to match anywhere
             in the target string.
+
+            .. note::
+                Using ``exact=False`` introduces a performance penalty - cleaning your
+                data beforehand will almost certainly be more performant.
         cache
             Use a cache of unique, converted dates to apply the conversion.
 
@@ -78,7 +82,7 @@ class StringNameSpace:
         strict: bool = True,
         exact: bool = True,
         cache: bool = True,
-        utc: bool = False,
+        utc: bool | None = None,
     ) -> Series:
         """
         Convert a Utf8 column into a Datetime column.
@@ -102,23 +106,32 @@ class StringNameSpace:
         exact
             Require an exact format match. If False, allow the format to match anywhere
             in the target string.
+
+            .. note::
+                Using ``exact=False`` introduces a performance penalty - cleaning your
+                data beforehand will almost certainly be more performant.
         cache
             Use a cache of unique, converted datetimes to apply the conversion.
         utc
             Parse time zone aware datetimes as UTC. This may be useful if you have data
             with mixed offsets.
 
+            .. deprecated:: 0.18.0
+                This is now a no-op, you can safely remove it.
+                Offset-naive strings are parsed as ``pl.Datetime(time_unit)``,
+                and offset-aware strings are converted to
+                ``pl.Datetime(time_unit, "UTC")``.
+
         Examples
         --------
         >>> s = pl.Series(["2020-01-01 01:00Z", "2020-01-01 02:00Z"])
         >>> s.str.to_datetime("%Y-%m-%d %H:%M%#z")
         shape: (2,)
-        Series: '' [datetime[μs, +00:00]]
+        Series: '' [datetime[μs, UTC]]
         [
-                2020-01-01 01:00:00 +00:00
-                2020-01-01 02:00:00 +00:00
+                2020-01-01 01:00:00 UTC
+                2020-01-01 02:00:00 UTC
         ]
-
         """
 
     def to_time(
@@ -166,8 +179,7 @@ class StringNameSpace:
         strict: bool = True,
         exact: bool = True,
         cache: bool = True,
-        utc: bool = False,
-        tz_aware: bool | NoDefault = no_default,
+        utc: bool | None = None,
     ) -> Series:
         """
         Convert a Utf8 column into a Date/Datetime/Time column.
@@ -186,18 +198,21 @@ class StringNameSpace:
         exact
             Require an exact format match. If False, allow the format to match anywhere
             in the target string. Conversion to the Time type is always exact.
+
+            .. note::
+                Using ``exact=False`` introduces a performance penalty - cleaning your
+                data beforehand will almost certainly be more performant.
         cache
             Use a cache of unique, converted dates to apply the datetime conversion.
         utc
             Parse time zone aware datetimes as UTC. This may be useful if you have data
             with mixed offsets.
-        tz_aware
-            Parse time zone aware datetimes. This may be automatically toggled by the
-            `format` given.
 
-            .. deprecated:: 0.16.17
-                This is now auto-inferred from the given `format`. You can safely drop
-                this argument, it will be removed in a future version.
+            .. deprecated:: 0.18.0
+                This is now a no-op, you can safely remove it.
+                Offset-naive strings are parsed as ``pl.Datetime(time_unit)``,
+                and offset-aware strings are converted to
+                ``pl.Datetime(time_unit, "UTC")``.
 
         Notes
         -----
@@ -212,10 +227,10 @@ class StringNameSpace:
         >>> s = pl.Series(["2020-01-01 01:00Z", "2020-01-01 02:00Z"])
         >>> s.str.strptime(pl.Datetime, "%Y-%m-%d %H:%M%#z")
         shape: (2,)
-        Series: '' [datetime[μs, +00:00]]
+        Series: '' [datetime[μs, UTC]]
         [
-                2020-01-01 01:00:00 +00:00
-                2020-01-01 02:00:00 +00:00
+                2020-01-01 01:00:00 UTC
+                2020-01-01 02:00:00 UTC
         ]
 
         Dealing with different formats.
@@ -245,8 +260,17 @@ class StringNameSpace:
                 2022-01-31
                 2001-07-08
         ]
-
         """
+        if utc is not None:
+            warnings.warn(
+                "The `utc` argument is now a no-op and has no effect. "
+                "You can safely remove it. "
+                "Offset-naive strings are parsed as ``pl.Datetime(time_unit)``, "
+                "and offset-aware strings are converted to "
+                '``pl.Datetime(time_unit, "UTC")``.',
+                DeprecationWarning,
+                stacklevel=find_stacklevel(),
+            )
         s = wrap_s(self._s)
         return (
             s.to_frame()
@@ -257,12 +281,44 @@ class StringNameSpace:
                     strict=strict,
                     exact=exact,
                     cache=cache,
-                    utc=utc,
-                    tz_aware=tz_aware,
                 )
             )
             .to_series()
         )
+
+    def to_decimal(
+        self,
+        inference_length: int = 100,
+    ) -> Series:
+        """
+        Convert a Utf8 column into a Decimal column.
+
+        This method infers the needed parameters ``precision`` and ``scale``.
+
+        Parameters
+        ----------
+        inference_length
+            Number of elements to parse to determine the `precision` and `scale`
+
+        Examples
+        --------
+        >>> s = pl.Series(
+        ...     ["40.12", "3420.13", "120134.19", "3212.98", "12.90", "143.09", "143.9"]
+        ... )
+        >>> s.str.to_decimal()
+        shape: (7,)
+        Series: '' [decimal[2]]
+        [
+            40.12
+            3420.13
+            120134.19
+            3212.98
+            12.9
+            143.09
+            143.9
+        ]
+
+        """
 
     def lengths(self) -> Series:
         """
@@ -503,7 +559,9 @@ class StringNameSpace:
 
         """
 
-    def json_extract(self, dtype: PolarsDataType | None = None) -> Series:
+    def json_extract(
+        self, dtype: PolarsDataType | None = None, infer_schema_length: int | None = 100
+    ) -> Series:
         """
         Parse string values as JSON.
 
@@ -514,6 +572,9 @@ class StringNameSpace:
         dtype
             The dtype to cast the extracted value to. If None, the dtype will be
             inferred from the JSON value.
+        infer_schema_length
+            How many rows to parse to determine the schema.
+            If ``None`` all rows are used.
 
         Examples
         --------
@@ -982,14 +1043,15 @@ class StringNameSpace:
         ]
 
         Characters can be stripped by passing a string as argument. Note that whitespace
-        will not be stripped automatically when doing so.
+        will not be stripped automatically when doing so, unless that whitespace is
+        also included in the string.
 
-        >>> s.str.strip("od\t")
+        >>> s.str.strip("o ")
         shape: (2,)
         Series: '' [str]
         [
-                " hello "
-                "worl"
+            "hell"
+            "	world"
         ]
 
         """
@@ -1054,12 +1116,12 @@ class StringNameSpace:
         Characters can be stripped by passing a string as argument. Note that whitespace
         will not be stripped automatically when doing so.
 
-        >>> s.str.rstrip("wod\t")
+        >>> s.str.rstrip("orld\t")
         shape: (2,)
         Series: '' [str]
         [
-                " hello "
-                "worl"
+            " hello "
+            "w"
         ]
 
         """
@@ -1141,10 +1203,55 @@ class StringNameSpace:
         """
 
     def to_lowercase(self) -> Series:
-        """Modify the strings to their lowercase equivalent."""
+        """
+        Modify the strings to their lowercase equivalent.
+
+        Examples
+        --------
+        >>> s = pl.Series("foo", ["CAT", "DOG"])
+        >>> s.str.to_lowercase()
+        shape: (2,)
+        Series: 'foo' [str]
+        [
+            "cat"
+            "dog"
+        ]
+
+        """
 
     def to_uppercase(self) -> Series:
-        """Modify the strings to their uppercase equivalent."""
+        """
+        Modify the strings to their uppercase equivalent.
+
+        Examples
+        --------
+        >>> s = pl.Series("foo", ["cat", "dog"])
+        >>> s.str.to_uppercase()
+        shape: (2,)
+        Series: 'foo' [str]
+        [
+            "CAT"
+            "DOG"
+        ]
+
+        """
+
+    def to_titlecase(self) -> Series:
+        """
+        Modify the strings to their titlecase equivalent.
+
+        Examples
+        --------
+        >>> s = pl.Series("sing", ["welcome to my world", "THERE'S NO TURNING BACK"])
+        >>> s.str.to_titlecase()
+        shape: (2,)
+        Series: 'sing' [str]
+        [
+            "Welcome To My …
+            "There's No Tur…
+        ]
+
+        """
 
     def slice(self, offset: int, length: int | None = None) -> Series:
         """

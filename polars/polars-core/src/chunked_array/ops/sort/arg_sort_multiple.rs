@@ -25,11 +25,12 @@ pub(crate) fn args_validate<T: PolarsDataType>(
 
 pub(crate) fn arg_sort_multiple_impl<T: PartialOrd + Send + IsFloat + Copy>(
     mut vals: Vec<(IdxSize, T)>,
-    other: &[Series],
-    descending: &[bool],
+    options: &SortMultipleOptions,
 ) -> PolarsResult<IdxCa> {
-    assert_eq!(descending.len() - 1, other.len());
-    let compare_inner: Vec<_> = other
+    let descending = &options.descending;
+    debug_assert_eq!(descending.len() - 1, options.other.len());
+    let compare_inner: Vec<_> = options
+        .other
         .iter()
         .map(|s| s.into_partial_ord_inner())
         .collect_trusted();
@@ -64,7 +65,7 @@ pub(crate) fn arg_sort_multiple_impl<T: PartialOrd + Send + IsFloat + Copy>(
 }
 
 pub fn _get_rows_encoded_compat_array(by: &Series) -> PolarsResult<ArrayRef> {
-    let by = convert_sort_column_multi_sort(by, true)?;
+    let by = convert_sort_column_multi_sort(by)?;
     let by = by.rechunk();
 
     let out = match by.dtype() {

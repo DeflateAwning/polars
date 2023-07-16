@@ -1,6 +1,5 @@
 use polars::{functions, time};
-use polars_core::datatypes::{TimeUnit, TimeZone};
-use polars_core::prelude::{DataFrame, IntoSeries};
+use polars_core::prelude::*;
 use pyo3::prelude::*;
 
 use crate::conversion::{get_df, get_series, Wrap};
@@ -65,29 +64,6 @@ pub fn concat_series(series: &PyAny) -> PyResult<PySeries> {
 }
 
 #[pyfunction]
-pub fn date_range(
-    start: i64,
-    stop: i64,
-    every: &str,
-    closed: Wrap<ClosedWindow>,
-    name: &str,
-    time_unit: Wrap<TimeUnit>,
-    time_zone: Option<TimeZone>,
-) -> PyResult<PySeries> {
-    let date_range = time::date_range_impl(
-        name,
-        start,
-        stop,
-        Duration::parse(every),
-        closed.0,
-        time_unit.0,
-        time_zone.as_ref(),
-    )
-    .map_err(PyPolarsErr::from)?;
-    Ok(date_range.into_series().into())
-}
-
-#[pyfunction]
 pub fn diag_concat_df(dfs: &PyAny) -> PyResult<PyDataFrame> {
     let iter = dfs.iter()?;
 
@@ -115,4 +91,16 @@ pub fn hor_concat_df(dfs: &PyAny) -> PyResult<PyDataFrame> {
 
     let df = functions::hor_concat_df(&dfs).map_err(PyPolarsErr::from)?;
     Ok(df.into())
+}
+
+#[pyfunction]
+pub fn time_range_eager(
+    start: i64,
+    stop: i64,
+    every: &str,
+    closed: Wrap<ClosedWindow>,
+) -> PyResult<PySeries> {
+    let time_range = time::time_range_impl("time", start, stop, Duration::parse(every), closed.0)
+        .map_err(PyPolarsErr::from)?;
+    Ok(time_range.into_series().into())
 }

@@ -13,6 +13,8 @@ use polars_time::{DynamicGroupOptions, RollingGroupOptions};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "python")]
+use crate::prelude::python_udf::PythonFunction;
 use crate::prelude::Expr;
 
 pub type FileCount = u32;
@@ -27,30 +29,18 @@ pub struct CsvParserOptions {
     pub eol_char: u8,
     pub has_header: bool,
     pub skip_rows: usize,
-    pub n_rows: Option<usize>,
-    pub with_columns: Option<Arc<Vec<String>>>,
     pub low_memory: bool,
     pub ignore_errors: bool,
-    pub cache: bool,
     pub null_values: Option<NullValues>,
-    pub rechunk: bool,
     pub encoding: CsvEncoding,
-    pub row_count: Option<RowCount>,
     pub try_parse_dates: bool,
-    pub file_counter: FileCount,
 }
 
 #[cfg(feature = "parquet")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct ParquetOptions {
-    pub n_rows: Option<usize>,
-    pub with_columns: Option<Arc<Vec<String>>>,
-    pub cache: bool,
     pub parallel: polars_io::parquet::ParallelStrategy,
-    pub rechunk: bool,
-    pub row_count: Option<RowCount>,
-    pub file_counter: FileCount,
     pub low_memory: bool,
     pub use_statistics: bool,
 }
@@ -81,41 +71,22 @@ pub struct IpcWriterOptions {
     pub maintain_order: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct IpcScanOptions {
-    pub n_rows: Option<usize>,
-    pub with_columns: Option<Arc<Vec<String>>>,
-    pub cache: bool,
-    pub row_count: Option<RowCount>,
-    pub rechunk: bool,
     pub memmap: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct IpcScanOptionsInner {
+/// Generic options for all file types
+pub struct FileScanOptions {
     pub n_rows: Option<usize>,
     pub with_columns: Option<Arc<Vec<String>>>,
     pub cache: bool,
     pub row_count: Option<RowCount>,
     pub rechunk: bool,
     pub file_counter: FileCount,
-    pub memmap: bool,
-}
-
-impl From<IpcScanOptions> for IpcScanOptionsInner {
-    fn from(options: IpcScanOptions) -> Self {
-        Self {
-            n_rows: options.n_rows,
-            with_columns: options.with_columns,
-            cache: options.cache,
-            row_count: options.row_count,
-            rechunk: options.rechunk,
-            file_counter: Default::default(),
-            memmap: options.memmap,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Copy, Default, Eq, PartialEq)]
@@ -127,6 +98,7 @@ pub struct UnionOptions {
     pub rows: (Option<usize>, usize),
     pub from_partitioned_ds: bool,
     pub flattened_by_opt: bool,
+    pub rechunk: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -156,7 +128,7 @@ pub struct DistinctOptions {
     pub slice: Option<(i64, usize)>,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum ApplyOptions {
     /// Collect groups to a list and apply the function over the groups.
@@ -171,20 +143,25 @@ pub enum ApplyOptions {
     ApplyFlat,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+// a boolean that can only be set to `false` safely
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct WindowOptions {
-    /// Explode the aggregated list and just do a hstack instead of a join
-    /// this requires the groups to be sorted to make any sense
-    pub explode: bool,
+pub struct UnsafeBool(bool);
+impl Default for UnsafeBool {
+    fn default() -> Self {
+        UnsafeBool(true)
+    }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct FunctionOptions {
     /// Collect groups to a list and apply the function over the groups.
     /// This can be important in aggregation context.
     pub collect_groups: ApplyOptions,
+    // used for formatting, (only for anonymous functions)
+    #[cfg_attr(feature = "serde", serde(skip_deserializing))]
+    pub fmt_str: &'static str,
     /// There can be two ways of expanding wildcards:
     ///
     /// Say the schema is 'a', 'b' and there is a function f
@@ -200,7 +177,6 @@ pub struct FunctionOptions {
     ///
     /// this also accounts for regex expansion
     pub input_wildcard_expansion: bool,
-
     /// automatically explode on unit length it ran as final aggregation.
     ///
     /// this is the case for aggregations like sum, min, covariance etc.
@@ -212,10 +188,6 @@ pub struct FunctionOptions {
     /// head_1(x) -> {1}
     /// sum(x) -> {4}
     pub auto_explode: bool,
-    // used for formatting, (only for anonymous functions)
-    #[cfg_attr(feature = "serde", serde(skip_deserializing))]
-    pub fmt_str: &'static str,
-
     // if the expression and its inputs should be cast to supertypes
     pub cast_to_supertypes: bool,
     // apply physical expression may rename the output of this function
@@ -223,6 +195,12 @@ pub struct FunctionOptions {
     // if set, then the `Series` passed to the function in the groupby operation
     // will ensure the name is set. This is an extra heap allocation per group.
     pub pass_name_to_apply: bool,
+    // For example a `unique` or a `slice`
+    pub changes_length: bool,
+    // Validate the output of a `map`.
+    // this should always be true or we could OOB
+    pub check_lengths: UnsafeBool,
+    pub allow_group_aware: bool,
 }
 
 impl FunctionOptions {
@@ -232,6 +210,14 @@ impl FunctionOptions {
     /// - Counts
     pub fn is_groups_sensitive(&self) -> bool {
         matches!(self.collect_groups, ApplyOptions::ApplyGroups)
+    }
+
+    #[cfg(feature = "fused")]
+    pub(crate) unsafe fn no_check_lengths(&mut self) {
+        self.check_lengths = UnsafeBool(false);
+    }
+    pub fn check_lengths(&self) -> bool {
+        self.check_lengths.0
     }
 }
 
@@ -245,6 +231,9 @@ impl Default for FunctionOptions {
             cast_to_supertypes: false,
             allow_rename: false,
             pass_name_to_apply: false,
+            changes_length: false,
+            check_lengths: UnsafeBool(true),
+            allow_group_aware: true,
         }
     }
 }
@@ -265,14 +254,14 @@ pub struct SortArguments {
     pub descending: Vec<bool>,
     pub nulls_last: bool,
     pub slice: Option<(i64, usize)>,
+    pub maintain_order: bool,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg(feature = "python")]
 pub struct PythonOptions {
-    // Serialized Fn() -> PolarsResult<DataFrame>
-    pub scan_fn: Vec<u8>,
+    pub scan_fn: Option<PythonFunction>,
     pub schema: SchemaRef,
     pub output_schema: Option<SchemaRef>,
     pub with_columns: Option<Arc<Vec<String>>>,

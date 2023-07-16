@@ -52,7 +52,7 @@ impl Series {
         let name = self.name();
 
         let mut ca = unsafe { ListChunked::from_chunks(name, vec![Box::new(arr)]) };
-        ca.to_logical(inner_type.clone());
+        ca.to_physical(inner_type.clone());
         ca.set_fast_explode();
 
         Ok(ca)
@@ -119,7 +119,7 @@ impl Series {
                 let mut offset = 0i64;
                 for _ in 0..rows {
                     let row = s_ref.slice(offset, cols as usize);
-                    builder.append_series(&row);
+                    builder.append_series(&row).unwrap();
                     offset += cols;
                 }
                 Ok(builder.finish().into_series())
@@ -141,7 +141,7 @@ mod test {
         let s = Series::new("a", &[1, 2, 3]);
 
         let mut builder = get_list_builder(s.dtype(), s.len(), 1, s.name())?;
-        builder.append_series(&s);
+        builder.append_series(&s).unwrap();
         let expected = builder.finish();
 
         let out = s.implode()?;

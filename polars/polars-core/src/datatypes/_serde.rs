@@ -1,8 +1,8 @@
 //! Having `Object<&;static> in [`DataType`] make serde tag the `Deserialize` trait bound 'static
 //! even though we skip serializing `Object`.
 //!
-//! We could use https://github.com/serde-rs/serde/issues/1712, but that gave problems caused by
-//! https://github.com/rust-lang/rust/issues/96956, so we make a dummy type without static
+//! We could use [serde_1712](https://github.com/serde-rs/serde/issues/1712), but that gave problems caused by
+//! [rust_96956](https://github.com/rust-lang/rust/issues/96956), so we make a dummy type without static
 pub use arrow::datatypes::DataType as ArrowDataType;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -59,6 +59,10 @@ pub enum SerializableDataType {
     Struct(Vec<Field>),
     // some logical types we cannot know statically, e.g. Datetime
     Unknown,
+    #[cfg(feature = "dtype-categorical")]
+    Categorical,
+    #[cfg(feature = "object")]
+    Object(String),
 }
 
 impl From<&DataType> for SerializableDataType {
@@ -87,7 +91,11 @@ impl From<&DataType> for SerializableDataType {
             Unknown => Self::Unknown,
             #[cfg(feature = "dtype-struct")]
             Struct(flds) => Self::Struct(flds.clone()),
-            _ => todo!(),
+            #[cfg(feature = "dtype-categorical")]
+            Categorical(_) => Self::Categorical,
+            #[cfg(feature = "object")]
+            Object(name) => Self::Object(name.to_string()),
+            dt => panic!("{dt:?} not supported"),
         }
     }
 }
@@ -117,6 +125,10 @@ impl From<SerializableDataType> for DataType {
             Unknown => Self::Unknown,
             #[cfg(feature = "dtype-struct")]
             Struct(flds) => Self::Struct(flds),
+            #[cfg(feature = "dtype-categorical")]
+            Categorical => Self::Categorical(None),
+            #[cfg(feature = "object")]
+            Object(_) => Self::Object("unknown"),
         }
     }
 }

@@ -1,11 +1,18 @@
-use polars_core::prelude::JoinType;
+use polars_core::prelude::{JoinArgs, JoinType};
 use polars_plan::prelude::*;
 
 pub(super) fn is_streamable_sort(args: &SortArguments) -> bool {
-    // check if slice is positive
-    match args.slice {
-        Some((offset, _)) => offset >= 0,
-        None => true,
+    // check if slice is positive or maintain order is true
+    match args {
+        SortArguments {
+            maintain_order: true,
+            ..
+        } => false,
+        SortArguments {
+            slice: Some((offset, _)),
+            ..
+        } => *offset >= 0,
+        SortArguments { slice: None, .. } => true,
     }
 }
 
@@ -14,6 +21,10 @@ pub(super) fn is_streamable(node: Node, expr_arena: &Arena<AExpr>, context: Cont
     let mut seen_column = false;
     let mut seen_lit_range = false;
     let all = expr_arena.iter(node).all(|(_, ae)| match ae {
+        AExpr::Function {
+            function: FunctionExpr::SetSortedFlag(_),
+            ..
+        } => true,
         AExpr::Function { options, .. } | AExpr::AnonymousFunction { options, .. } => match context
         {
             Context::Default => matches!(
@@ -26,7 +37,10 @@ pub(super) fn is_streamable(node: Node, expr_arena: &Arena<AExpr>, context: Cont
             seen_column = true;
             true
         }
-        AExpr::BinaryExpr { .. } | AExpr::Alias(_, _) | AExpr::Cast { .. } => true,
+        AExpr::Ternary { .. }
+        | AExpr::BinaryExpr { .. }
+        | AExpr::Alias(_, _)
+        | AExpr::Cast { .. } => true,
         AExpr::Literal(lv) => match lv {
             LiteralValue::Series(_) | LiteralValue::Range { .. } => {
                 seen_lit_range = true;
@@ -61,11 +75,12 @@ pub(super) fn all_column(exprs: &[Node], expr_arena: &Arena<AExpr>) -> bool {
         .all(|node| matches!(expr_arena.get(*node), AExpr::Column(_)))
 }
 
-pub(super) fn streamable_join(join_type: &JoinType) -> bool {
-    match join_type {
+pub(super) fn streamable_join(args: &JoinArgs) -> bool {
+    let supported = match args.how {
         #[cfg(feature = "cross_join")]
         JoinType::Cross => true,
         JoinType::Inner | JoinType::Left => true,
         _ => false,
-    }
+    };
+    supported && !args.validation.needs_checks()
 }

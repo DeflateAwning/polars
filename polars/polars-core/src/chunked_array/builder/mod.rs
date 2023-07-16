@@ -1,5 +1,7 @@
 mod binary;
 mod boolean;
+#[cfg(feature = "dtype-array")]
+pub mod fixed_size_list;
 mod from;
 pub mod list;
 mod primitive;
@@ -14,6 +16,8 @@ use arrow::array::*;
 use arrow::bitmap::Bitmap;
 pub use binary::*;
 pub use boolean::*;
+#[cfg(feature = "dtype-array")]
+pub(crate) use fixed_size_list::*;
 pub use list::*;
 pub use primitive::*;
 pub use utf8::*;
@@ -234,8 +238,8 @@ mod test {
         let s2 = Int32Chunked::from_slice("b", &[4, 5, 6]).into_series();
         s1.append(&s2).unwrap();
 
-        builder.append_series(&s1);
-        builder.append_series(&s2);
+        builder.append_series(&s1).unwrap();
+        builder.append_series(&s2).unwrap();
         let ls = builder.finish();
         if let AnyValue::List(s) = ls.get_any_value(0).unwrap() {
             // many chunks are aggregated to one in the ListArray
@@ -255,7 +259,7 @@ mod test {
 
         let mut builder =
             ListPrimitiveChunkedBuilder::<Int32Type>::new("a", 10, 5, DataType::Int32);
-        builder.append_series(&s1);
+        builder.append_series(&s1).unwrap();
         builder.append_null();
 
         let out = builder.finish();

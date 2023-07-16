@@ -113,7 +113,8 @@ fn read_unordered_json() {
 
 #[test]
 fn read_ndjson_with_trailing_newline() {
-    let data = r#"{"Column1":"Value1"}\n"#;
+    let data = r#"{"Column1":"Value1"}
+"#;
 
     let file = Cursor::new(data);
     let df = JsonReader::new(file)
@@ -146,11 +147,7 @@ fn test_read_ndjson_iss_5875() {
     let mut schema = Schema::new();
     schema.with_column(
         "struct".into(),
-        DataType::Struct(vec![
-            field_int_inner.clone(),
-            field_float_inner.clone(),
-            field_str_inner.clone(),
-        ]),
+        DataType::Struct(vec![field_int_inner, field_float_inner, field_str_inner]),
     );
     schema.with_column("float".into(), DataType::Float64);
 

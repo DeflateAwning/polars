@@ -65,14 +65,13 @@ where
             }
             Ok(Box::new(sources::DataFrameSource::from_df(df)) as Box<dyn Source>)
         }
-        #[cfg(feature = "csv")]
-        CsvScan {
+        Scan {
             path,
             file_info,
-            options,
+            file_options,
             predicate,
             output_schema,
-            ..
+            scan_type,
         } => {
             // add predicate to operators
             if let (true, Some(predicate)) = (push_predicate, predicate) {
@@ -81,36 +80,39 @@ where
                 let op = Box::new(op) as Box<dyn Operator>;
                 operator_objects.push(op)
             }
-            let src = sources::CsvSource::new(path, file_info.schema, options, verbose)?;
-            Ok(Box::new(src) as Box<dyn Source>)
-        }
-        #[cfg(feature = "parquet")]
-        ParquetScan {
-            path,
-            file_info,
-            options,
-            cloud_options,
-            predicate,
-            output_schema,
-            ..
-        } => {
-            // add predicate to operators
-            if let (true, Some(predicate)) = (push_predicate, predicate) {
-                let predicate = to_physical(predicate, expr_arena, output_schema.as_ref())?;
-                let op = operators::FilterOperator { predicate };
-                let op = Box::new(op) as Box<dyn Operator>;
-                operator_objects.push(op)
+            match scan_type {
+                #[cfg(feature = "csv")]
+                FileScan::Csv {
+                    options: csv_options,
+                } => {
+                    let src = sources::CsvSource::new(
+                        path,
+                        file_info.schema,
+                        csv_options,
+                        file_options,
+                        verbose,
+                    )?;
+                    Ok(Box::new(src) as Box<dyn Source>)
+                }
+                #[cfg(feature = "parquet")]
+                FileScan::Parquet {
+                    options: parquet_options,
+                    cloud_options,
+                } => {
+                    let src = sources::ParquetSource::new(
+                        path,
+                        parquet_options,
+                        cloud_options,
+                        file_options,
+                        file_info.schema,
+                        verbose,
+                    )?;
+                    Ok(Box::new(src) as Box<dyn Source>)
+                }
+                _ => todo!(),
             }
-            let src = sources::ParquetSource::new(
-                path,
-                options,
-                cloud_options,
-                &file_info.schema,
-                verbose,
-            )?;
-            Ok(Box::new(src) as Box<dyn Source>)
         }
-        _ => todo!(),
+        _ => unreachable!(),
     }
 }
 
@@ -138,7 +140,7 @@ where
                 FileType::Ipc(options) => {
                     Box::new(IpcSink::new(path, *options, input_schema.as_ref())?) as Box<dyn Sink>
                 }
-                FileType::Memory => Box::new(OrderedSink::new()),
+                FileType::Memory => Box::new(OrderedSink::new()) as Box<dyn Sink>,
             }
         }
         Join {
@@ -150,12 +152,12 @@ where
             ..
         } => {
             // slice pushdown optimization should not set this one in a streaming query.
-            assert!(options.slice.is_none());
+            assert!(options.args.slice.is_none());
 
-            match &options.how {
+            match &options.args.how {
                 #[cfg(feature = "cross_join")]
                 JoinType::Cross => {
-                    Box::new(CrossJoin::new(options.suffix.clone())) as Box<dyn Sink>
+                    Box::new(CrossJoin::new(options.args.suffix().into())) as Box<dyn Sink>
                 }
                 join_type @ JoinType::Inner | join_type @ JoinType::Left => {
                     let input_schema_left = lp_arena.get(*input_left).schema(lp_arena);
@@ -182,12 +184,12 @@ where
                     };
 
                     Box::new(GenericBuild::new(
-                        Arc::from(options.suffix.as_ref()),
+                        Arc::from(options.args.suffix()),
                         join_type.clone(),
                         swapped,
                         join_columns_left,
                         join_columns_right,
-                    ))
+                    )) as Box<dyn Sink>
                 }
                 _ => unimplemented!(),
             }
@@ -220,7 +222,7 @@ where
                     })
                     .collect::<PolarsResult<Vec<_>>>()?;
 
-                let sort_sink = SortSinkMultiple::new(args.clone(), &input_schema, sort_idx);
+                let sort_sink = SortSinkMultiple::new(args.clone(), input_schema, sort_idx);
                 Box::new(sort_sink) as Box<dyn Sink>
             }
         }
@@ -427,13 +429,11 @@ where
         }
         MapFunction {
             function: FunctionNode::FastProjection { columns },
-            ..
+            input,
         } => {
-            // TODO! pass schema to FastProjection so that
-            // projection can be based on already known schema.
-            let op = operators::FastProjectionOperator {
-                columns: columns.clone(),
-            };
+            let input_schema = lp_arena.get(*input).schema(lp_arena);
+            let op =
+                operators::FastProjectionOperator::new(columns.clone(), input_schema.into_owned());
             Box::new(op) as Box<dyn Operator>
         }
         MapFunction { function, .. } => {
@@ -482,17 +482,7 @@ where
                 true,
                 verbose,
             )?,
-            #[cfg(feature = "csv")]
-            lp @ CsvScan { .. } => get_source(
-                lp.clone(),
-                &mut operator_objects,
-                expr_arena,
-                &to_physical,
-                true,
-                verbose,
-            )?,
-            #[cfg(feature = "parquet")]
-            lp @ ParquetScan { .. } => get_source(
+            lp @ Scan { .. } => get_source(
                 lp.clone(),
                 &mut operator_objects,
                 expr_arena,
@@ -563,7 +553,7 @@ where
 }
 
 pub fn swap_join_order(options: &JoinOptions) -> bool {
-    matches!(options.how, JoinType::Left)
+    matches!(options.args.how, JoinType::Left)
         || match (options.rows_left, options.rows_right) {
             ((Some(left), _), (Some(right), _)) => left > right,
             ((_, left), (_, right)) => left > right,

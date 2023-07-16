@@ -11,24 +11,22 @@ from polars.datatypes import (
     Date,
     Datetime,
     Duration,
-    Int32,
     Int64,
-    Struct,
     Time,
-    UInt32,
     is_polars_dtype,
-    py_type_to_dtype,
 )
 from polars.dependencies import _check_for_numpy
 from polars.dependencies import numpy as np
-from polars.utils._parse_expr_input import expr_to_lit_or_expr, selection_to_pyexpr_list
+from polars.utils._parse_expr_input import (
+    parse_as_expression,
+    parse_as_list_of_expressions,
+)
 from polars.utils._wrap import wrap_df, wrap_expr
 from polars.utils.convert import (
     _datetime_to_pl_timestamp,
     _time_to_pl_time,
     _timedelta_to_pl_timedelta,
 )
-from polars.utils.decorators import deprecated_alias
 from polars.utils.various import find_stacklevel
 
 with contextlib.suppress(ImportError):  # Module not available when building docs
@@ -36,7 +34,7 @@ with contextlib.suppress(ImportError):  # Module not available when building doc
 
 
 if TYPE_CHECKING:
-    import sys
+    from typing import Literal
 
     from polars import DataFrame, Expr, LazyFrame, Series
     from polars.type_aliases import (
@@ -44,16 +42,9 @@ if TYPE_CHECKING:
         EpochTimeUnit,
         IntoExpr,
         PolarsDataType,
-        PythonLiteral,
         RollingInterpolationMethod,
-        SchemaDict,
         TimeUnit,
     )
-
-    if sys.version_info >= (3, 8):
-        from typing import Literal
-    else:
-        from typing_extensions import Literal
 
 
 def col(
@@ -238,7 +229,7 @@ def element() -> Expr:
 
     >>> df = pl.DataFrame({"a": [1, 8, 3], "b": [4, 5, 2]})
     >>> df.with_columns(
-    ...     pl.concat_list(["a", "b"]).arr.eval(pl.element().rank()).alias("rank")
+    ...     pl.concat_list(["a", "b"]).list.eval(pl.element().rank()).alias("rank")
     ... )
     shape: (3, 3)
     ┌─────┬─────┬────────────┐
@@ -255,7 +246,7 @@ def element() -> Expr:
 
     >>> df = pl.DataFrame({"a": [1, 8, 3], "b": [4, 5, 2]})
     >>> df.with_columns(
-    ...     pl.concat_list(["a", "b"]).arr.eval(pl.element() * 2).alias("a_b_doubled")
+    ...     pl.concat_list(["a", "b"]).list.eval(pl.element() * 2).alias("a_b_doubled")
     ... )
     shape: (3, 3)
     ┌─────┬─────┬─────────────┐
@@ -290,6 +281,9 @@ def count(column: None = None) -> Expr:
 def count(column: str | Series | None = None) -> Expr | int:
     """
     Count the number of values in this column/context.
+
+    .. warning::
+        `null` is deemed a value in this context.
 
     Parameters
     ----------
@@ -328,6 +322,11 @@ def count(column: str | Series | None = None) -> Expr | int:
         return wrap_expr(plr.count())
 
     if isinstance(column, pl.Series):
+        warnings.warn(
+            "passing a Series to `count` is deprecated. Use `Series.len()` instead.",
+            DeprecationWarning,
+            stacklevel=find_stacklevel(),
+        )
         return column.len()
     return col(column).count()
 
@@ -342,27 +341,6 @@ def implode(name: str) -> Expr:
         Name of the column that should be imploded.
 
     """
-    return col(name).implode()
-
-
-def list_(name: str) -> Expr:
-    """
-    Aggregate to list.
-
-    .. deprecated:: 0.17.3
-        ``list`` will be removed in favor of ``implode``.
-
-    Parameters
-    ----------
-    name
-        Name of the column that should be aggregated into a list.
-
-    """
-    warnings.warn(
-        "`pl.list` is deprecated, please use `pl.implode` instead.",
-        DeprecationWarning,
-        stacklevel=find_stacklevel(),
-    )
     return col(name).implode()
 
 
@@ -406,6 +384,11 @@ def std(column: str | Series, ddof: int = 1) -> Expr | float | None:
 
     """
     if isinstance(column, pl.Series):
+        warnings.warn(
+            "passing a Series to `std` is deprecated. Use `Series.std()` instead.",
+            DeprecationWarning,
+            stacklevel=find_stacklevel(),
+        )
         return column.std(ddof)
     return col(column).std(ddof)
 
@@ -450,322 +433,13 @@ def var(column: str | Series, ddof: int = 1) -> Expr | float | None:
 
     """
     if isinstance(column, pl.Series):
+        warnings.warn(
+            "passing a Series to `var` is deprecated. Use `Series.var()` instead.",
+            DeprecationWarning,
+            stacklevel=find_stacklevel(),
+        )
         return column.var(ddof)
     return col(column).var(ddof)
-
-
-@overload
-def max(exprs: Series) -> PythonLiteral | None:  # type: ignore[misc]
-    ...
-
-
-@overload
-def max(exprs: IntoExpr | Iterable[IntoExpr], *more_exprs: IntoExpr) -> Expr:
-    ...
-
-
-def max(exprs: IntoExpr | Iterable[IntoExpr], *more_exprs: IntoExpr) -> Expr | Any:
-    """
-    Get the maximum value.
-
-    If a single string is passed, this is an alias for ``pl.col(name).max()``.
-    If a single Series is passed, this is an alias for ``Series.max()``.
-
-    Otherwise, this function computes the maximum value horizontally across multiple
-    columns.
-
-    Parameters
-    ----------
-    exprs
-        Column(s) to use in the aggregation. Accepts expression input. Strings are
-        parsed as column names, other non-expression inputs are parsed as literals.
-    *more_exprs
-        Additional columns to use in the aggregation, specified as positional arguments.
-
-    Examples
-    --------
-    Get the maximum value by row by passing multiple columns/expressions.
-
-    >>> df = pl.DataFrame(
-    ...     {
-    ...         "a": [1, 8, 3],
-    ...         "b": [4, 5, 2],
-    ...         "c": ["foo", "bar", "foo"],
-    ...     }
-    ... )
-    >>> df.select(pl.max("a", "b"))
-    shape: (3, 1)
-    ┌─────┐
-    │ max │
-    │ --- │
-    │ i64 │
-    ╞═════╡
-    │ 4   │
-    │ 8   │
-    │ 3   │
-    └─────┘
-
-    Get the maximum value of a column by passing a single column name.
-
-    >>> df.select(pl.max("a"))
-    shape: (1, 1)
-    ┌─────┐
-    │ a   │
-    │ --- │
-    │ i64 │
-    ╞═════╡
-    │ 8   │
-    └─────┘
-
-    Get column-wise maximums for multiple columns by passing a regular expression,
-    or call ``.max()`` on a multi-column expression instead.
-
-    >>> df.select(pl.max("^a|b$"))
-    shape: (1, 2)
-    ┌─────┬─────┐
-    │ a   ┆ b   │
-    │ --- ┆ --- │
-    │ i64 ┆ i64 │
-    ╞═════╪═════╡
-    │ 8   ┆ 5   │
-    └─────┴─────┘
-    >>> df.select(pl.col("a", "b").max())
-    shape: (1, 2)
-    ┌─────┬─────┐
-    │ a   ┆ b   │
-    │ --- ┆ --- │
-    │ i64 ┆ i64 │
-    ╞═════╪═════╡
-    │ 8   ┆ 5   │
-    └─────┴─────┘
-
-    """
-    if not more_exprs:
-        if isinstance(exprs, pl.Series):
-            return exprs.max()
-        elif isinstance(exprs, str):
-            return col(exprs).max()
-
-    exprs = selection_to_pyexpr_list(exprs)
-    if more_exprs:
-        exprs.extend(selection_to_pyexpr_list(more_exprs))
-    return wrap_expr(plr.max_exprs(exprs))
-
-
-@overload
-def min(exprs: Series) -> PythonLiteral | None:  # type: ignore[misc]
-    ...
-
-
-@overload
-def min(exprs: IntoExpr | Iterable[IntoExpr], *more_exprs: IntoExpr) -> Expr:
-    ...
-
-
-def min(
-    exprs: IntoExpr | Iterable[IntoExpr], *more_exprs: IntoExpr
-) -> Expr | PythonLiteral | None:
-    """
-    Get the minimum value.
-
-    If a single string is passed, this is an alias for ``pl.col(name).min()``.
-    If a single Series is passed, this is an alias for ``Series.min()``.
-
-    Otherwise, this function computes the minimum value horizontally across multiple
-    columns.
-
-    Parameters
-    ----------
-    exprs
-        Column(s) to use in the aggregation. Accepts expression input. Strings are
-        parsed as column names, other non-expression inputs are parsed as literals.
-    *more_exprs
-        Additional columns to use in the aggregation, specified as positional arguments.
-
-    Examples
-    --------
-    Get the minimum value by row by passing multiple columns/expressions.
-
-    >>> df = pl.DataFrame(
-    ...     {
-    ...         "a": [1, 8, 3],
-    ...         "b": [4, 5, 2],
-    ...         "c": ["foo", "bar", "foo"],
-    ...     }
-    ... )
-    >>> df.select(pl.min("a", "b"))
-    shape: (3, 1)
-    ┌─────┐
-    │ min │
-    │ --- │
-    │ i64 │
-    ╞═════╡
-    │ 1   │
-    │ 5   │
-    │ 2   │
-    └─────┘
-
-    Get the minimum value of a column by passing a single column name.
-
-    >>> df.select(pl.min("a"))
-    shape: (1, 1)
-    ┌─────┐
-    │ a   │
-    │ --- │
-    │ i64 │
-    ╞═════╡
-    │ 1   │
-    └─────┘
-
-    Get column-wise minimums for multiple columns by passing a regular expression,
-    or call ``.min()`` on a multi-column expression instead.
-
-    >>> df.select(pl.min("^a|b$"))
-    shape: (1, 2)
-    ┌─────┬─────┐
-    │ a   ┆ b   │
-    │ --- ┆ --- │
-    │ i64 ┆ i64 │
-    ╞═════╪═════╡
-    │ 1   ┆ 2   │
-    └─────┴─────┘
-    >>> df.select(pl.col("a", "b").min())
-    shape: (1, 2)
-    ┌─────┬─────┐
-    │ a   ┆ b   │
-    │ --- ┆ --- │
-    │ i64 ┆ i64 │
-    ╞═════╪═════╡
-    │ 1   ┆ 2   │
-    └─────┴─────┘
-
-    """
-    if not more_exprs:
-        if isinstance(exprs, pl.Series):
-            return exprs.min()
-        elif isinstance(exprs, str):
-            return col(exprs).min()
-
-    exprs = selection_to_pyexpr_list(exprs)
-    if more_exprs:
-        exprs.extend(selection_to_pyexpr_list(more_exprs))
-    return wrap_expr(plr.min_exprs(exprs))
-
-
-@overload
-def sum(exprs: Series) -> int | float:  # type: ignore[misc]
-    ...
-
-
-@overload
-def sum(exprs: IntoExpr | Iterable[IntoExpr], *more_exprs: IntoExpr) -> Expr:
-    ...
-
-
-@deprecated_alias(column="exprs")
-def sum(
-    exprs: IntoExpr | Iterable[IntoExpr], *more_exprs: IntoExpr
-) -> Expr | int | float:
-    """
-    Sum all values.
-
-    If a single string is passed, this is an alias for ``pl.col(name).sum()``.
-    If a single Series is passed, this is an alias for ``Series.sum()``.
-
-    Otherwise, this function computes the sum horizontally across multiple columns.
-
-    Parameters
-    ----------
-    exprs
-        Column(s) to use in the aggregation. Accepts expression input. Strings are
-        parsed as column names, other non-expression inputs are parsed as literals.
-    *more_exprs
-        Additional columns to use in the aggregation, specified as positional arguments.
-
-    Examples
-    --------
-    >>> df = pl.DataFrame(
-    ...     {
-    ...         "a": [1, 2],
-    ...         "b": [3, 4],
-    ...         "c": [5, 6],
-    ...     }
-    ... )
-    >>> df
-    shape: (2, 3)
-    ┌─────┬─────┬─────┐
-    │ a   ┆ b   ┆ c   │
-    │ --- ┆ --- ┆ --- │
-    │ i64 ┆ i64 ┆ i64 │
-    ╞═════╪═════╪═════╡
-    │ 1   ┆ 3   ┆ 5   │
-    │ 2   ┆ 4   ┆ 6   │
-    └─────┴─────┴─────┘
-
-    Sum a column by name:
-
-    >>> df.select(pl.sum("a"))
-    shape: (1, 1)
-    ┌─────┐
-    │ a   │
-    │ --- │
-    │ i64 │
-    ╞═════╡
-    │ 3   │
-    └─────┘
-
-    Sum a list of columns/expressions horizontally:
-
-    >>> df.with_columns(pl.sum("a", "c"))
-    shape: (2, 4)
-    ┌─────┬─────┬─────┬─────┐
-    │ a   ┆ b   ┆ c   ┆ sum │
-    │ --- ┆ --- ┆ --- ┆ --- │
-    │ i64 ┆ i64 ┆ i64 ┆ i64 │
-    ╞═════╪═════╪═════╪═════╡
-    │ 1   ┆ 3   ┆ 5   ┆ 6   │
-    │ 2   ┆ 4   ┆ 6   ┆ 8   │
-    └─────┴─────┴─────┴─────┘
-
-    Sum a series:
-
-    >>> pl.sum(df.get_column("a"))
-    3
-
-    To aggregate the sums for more than one column/expression use ``pl.col(list).sum()``
-    or a regular expression selector like ``pl.sum(regex)``:
-
-    >>> df.select(pl.col("a", "c").sum())
-    shape: (1, 2)
-    ┌─────┬─────┐
-    │ a   ┆ c   │
-    │ --- ┆ --- │
-    │ i64 ┆ i64 │
-    ╞═════╪═════╡
-    │ 3   ┆ 11  │
-    └─────┴─────┘
-
-    >>> df.select(pl.sum("^.*[bc]$"))
-    shape: (1, 2)
-    ┌─────┬─────┐
-    │ b   ┆ c   │
-    │ --- ┆ --- │
-    │ i64 ┆ i64 │
-    ╞═════╪═════╡
-    │ 7   ┆ 11  │
-    └─────┴─────┘
-
-    """
-    if not more_exprs:
-        if isinstance(exprs, pl.Series):
-            return exprs.sum()
-        elif isinstance(exprs, str):
-            return col(exprs).sum()
-
-    exprs = selection_to_pyexpr_list(exprs)
-    if more_exprs:
-        exprs.extend(selection_to_pyexpr_list(more_exprs))
-    return wrap_expr(plr.sum_exprs(exprs))
 
 
 @overload
@@ -794,11 +468,14 @@ def mean(column: str | Series) -> Expr | float | None:
     ╞═════╡
     │ 4.0 │
     └─────┘
-    >>> pl.mean(df["a"])
-    4.0
 
     """
     if isinstance(column, pl.Series):
+        warnings.warn(
+            "passing a Series to `mean` is deprecated. Use `Series.mean()` instead.",
+            DeprecationWarning,
+            stacklevel=find_stacklevel(),
+        )
         return column.mean()
     return col(column).mean()
 
@@ -829,8 +506,6 @@ def avg(column: str | Series) -> Expr | float:
     ╞═════╡
     │ 4.0 │
     └─────┘
-    >>> pl.avg(df["a"])
-    4.0
 
     """
     return mean(column)
@@ -862,11 +537,14 @@ def median(column: str | Series) -> Expr | float | int | None:
     ╞═════╡
     │ 3.0 │
     └─────┘
-    >>> pl.median(df["a"])
-    3.0
 
     """
     if isinstance(column, pl.Series):
+        warnings.warn(
+            "passing a Series to `median` is deprecated. Use `Series.median()` instead.",
+            DeprecationWarning,
+            stacklevel=find_stacklevel(),
+        )
         return column.median()
     return col(column).median()
 
@@ -897,11 +575,14 @@ def n_unique(column: str | Series) -> Expr | int:
     ╞═════╡
     │ 2   │
     └─────┘
-    >>> pl.n_unique(df["a"])
-    2
 
     """
     if isinstance(column, pl.Series):
+        warnings.warn(
+            "passing a Series to `n_unique` is deprecated. Use `Series.n_unique()` instead.",
+            DeprecationWarning,
+            stacklevel=find_stacklevel(),
+        )
         return column.n_unique()
     return col(column).n_unique()
 
@@ -986,14 +667,17 @@ def first(column: str | Series | None = None) -> Expr | Any:
     ╞═════╡
     │ 1   │
     └─────┘
-    >>> pl.first(df["a"])
-    1
 
     """
     if column is None:
         return wrap_expr(plr.first())
 
     if isinstance(column, pl.Series):
+        warnings.warn(
+            "passing a Series to `first` is deprecated. Use `series[0]` instead.",
+            DeprecationWarning,
+            stacklevel=find_stacklevel(),
+        )
         if column.len() > 0:
             return column[0]
         else:
@@ -1049,14 +733,17 @@ def last(column: str | Series | None = None) -> Expr:
     ╞═════╡
     │ 3   │
     └─────┘
-    >>> pl.last(df["a"])
-    3
 
     """
     if column is None:
         return wrap_expr(plr.last())
 
     if isinstance(column, pl.Series):
+        warnings.warn(
+            "passing a Series to `last` is deprecated. Use `series[-1]` instead.",
+            DeprecationWarning,
+            stacklevel=find_stacklevel(),
+        )
         if column.len() > 0:
             return column[-1]
         else:
@@ -1109,16 +796,14 @@ def head(column: str | Series, n: int = 10) -> Expr | Series:
     │ 1   │
     │ 8   │
     └─────┘
-    >>> pl.head(df["a"], 2)
-    shape: (2,)
-    Series: 'a' [i64]
-    [
-        1
-        8
-    ]
 
     """
     if isinstance(column, pl.Series):
+        warnings.warn(
+            "passing a Series to `head` is deprecated. Use `Series.head()` instead.",
+            DeprecationWarning,
+            stacklevel=find_stacklevel(),
+        )
         return column.head(n)
     return col(column).head(n)
 
@@ -1168,16 +853,14 @@ def tail(column: str | Series, n: int = 10) -> Expr | Series:
     │ 8   │
     │ 3   │
     └─────┘
-    >>> pl.tail(df["a"], 2)
-    shape: (2,)
-    Series: 'a' [i64]
-    [
-        8
-        3
-    ]
 
     """
     if isinstance(column, pl.Series):
+        warnings.warn(
+            "passing a Series to `tail` is deprecated. Use `Series.tail()` instead.",
+            DeprecationWarning,
+            stacklevel=find_stacklevel(),
+        )
         return column.tail(n)
     return col(column).tail(n)
 
@@ -1238,10 +921,13 @@ def lit(
             if getattr(dtype, "time_zone", None) is None
             else getattr(dtype, "time_zone", None)
         )
-        if value.tzinfo is not None and getattr(dtype, "time_zone", None) is not None:
+        if (
+            value.tzinfo is not None
+            and getattr(dtype, "time_zone", None) is not None
+            and dtype.time_zone != str(value.tzinfo)  # type: ignore[union-attr]
+        ):
             raise TypeError(
-                "Cannot cast tz-aware value to tz-aware dtype. "
-                "Please drop the time zone from the dtype."
+                f"Time zone of dtype ({dtype.time_zone}) differs from time zone of value ({value.tzinfo})."  # type: ignore[union-attr]
             )
         e = lit(_datetime_to_pl_timestamp(value, time_unit)).cast(Datetime(time_unit))
         if time_zone is not None:
@@ -1301,204 +987,6 @@ def lit(
     return wrap_expr(plr.lit(item, allow_object))
 
 
-@overload
-def cumsum(exprs: Series) -> Series:  # type: ignore[misc]
-    ...
-
-
-@overload
-def cumsum(exprs: IntoExpr | Iterable[IntoExpr], *more_exprs: IntoExpr) -> Expr:
-    ...
-
-
-@deprecated_alias(column="exprs")
-def cumsum(
-    exprs: IntoExpr | Iterable[IntoExpr], *more_exprs: IntoExpr
-) -> Expr | Series:
-    """
-    Cumulatively sum all values.
-
-    If a single string is passed, this is an alias for ``pl.col(name).cumsum()``.
-    If a single Series is passed, this is an alias for ``Series.cumsum()``.
-
-    Otherwise, this function computes the cumulative sum horizontally across multiple
-    columns.
-
-    Parameters
-    ----------
-    exprs
-        Column(s) to use in the aggregation. Accepts expression input. Strings are
-        parsed as column names, other non-expression inputs are parsed as literals.
-    *more_exprs
-        Additional columns to use in the aggregation, specified as positional arguments.
-
-    Examples
-    --------
-    >>> df = pl.DataFrame(
-    ...     {
-    ...         "a": [1, 2],
-    ...         "b": [3, 4],
-    ...         "c": [5, 6],
-    ...     }
-    ... )
-    >>> df
-    shape: (2, 3)
-    ┌─────┬─────┬─────┐
-    │ a   ┆ b   ┆ c   │
-    │ --- ┆ --- ┆ --- │
-    │ i64 ┆ i64 ┆ i64 │
-    ╞═════╪═════╪═════╡
-    │ 1   ┆ 3   ┆ 5   │
-    │ 2   ┆ 4   ┆ 6   │
-    └─────┴─────┴─────┘
-
-    Cumulatively sum a column by name:
-
-    >>> df.select(pl.cumsum("a"))
-    shape: (2, 1)
-    ┌─────┐
-    │ a   │
-    │ --- │
-    │ i64 │
-    ╞═════╡
-    │ 1   │
-    │ 3   │
-    └─────┘
-
-    Cumulatively sum a list of columns/expressions horizontally:
-
-    >>> df.with_columns(pl.cumsum("a", "c"))
-    shape: (2, 4)
-    ┌─────┬─────┬─────┬───────────┐
-    │ a   ┆ b   ┆ c   ┆ cumsum    │
-    │ --- ┆ --- ┆ --- ┆ ---       │
-    │ i64 ┆ i64 ┆ i64 ┆ struct[2] │
-    ╞═════╪═════╪═════╪═══════════╡
-    │ 1   ┆ 3   ┆ 5   ┆ {1,6}     │
-    │ 2   ┆ 4   ┆ 6   ┆ {2,8}     │
-    └─────┴─────┴─────┴───────────┘
-
-    """
-    if not more_exprs:
-        if isinstance(exprs, pl.Series):
-            return exprs.cumsum()
-        elif isinstance(exprs, str):
-            return col(exprs).cumsum()
-
-    exprs = selection_to_pyexpr_list(exprs)
-    if more_exprs:
-        exprs.extend(selection_to_pyexpr_list(more_exprs))
-
-    # (Expr): use u32 as that will not cast to float as eagerly
-    exprs_wrapped = [wrap_expr(e) for e in exprs]
-    return cumfold(lit(0).cast(UInt32), lambda a, b: a + b, exprs_wrapped).alias(
-        "cumsum"
-    )
-
-
-def spearman_rank_corr(
-    a: str | Expr, b: str | Expr, ddof: int = 1, *, propagate_nans: bool = False
-) -> Expr:
-    """
-    Compute the spearman rank correlation between two columns.
-
-    Missing data will be excluded from the computation.
-
-    .. deprecated:: 0.16.10
-        ``spearman_rank_corr`` will be removed in favor of
-        ``corr(..., method="spearman")``.
-
-    Parameters
-    ----------
-    a
-        Column name or Expression.
-    b
-        Column name or Expression.
-    ddof
-        “Delta Degrees of Freedom”: the divisor used in the calculation is N - ddof,
-        where N represents the number of elements.
-        By default ddof is 1.
-    propagate_nans
-        If `True` any `NaN` encountered will lead to `NaN` in the output.
-        Defaults to `False` where `NaN` are regarded as larger than any finite number
-        and thus lead to the highest rank.
-
-    See Also
-    --------
-    corr
-
-    Examples
-    --------
-    >>> df = pl.DataFrame({"a": [1, 8, 3], "b": [4, 5, 2], "c": ["foo", "bar", "foo"]})
-    >>> df.select(pl.spearman_rank_corr("a", "b"))  # doctest: +SKIP
-    shape: (1, 1)
-    ┌─────┐
-    │ a   │
-    │ --- │
-    │ f64 │
-    ╞═════╡
-    │ 0.5 │
-    └─────┘
-    """
-    warnings.warn(
-        "`spearman_rank_corr()` is deprecated in favor of `corr()`",
-        DeprecationWarning,
-        stacklevel=find_stacklevel(),
-    )
-    if isinstance(a, str):
-        a = col(a)
-    if isinstance(b, str):
-        b = col(b)
-    return wrap_expr(plr.spearman_rank_corr(a._pyexpr, b._pyexpr, ddof, propagate_nans))
-
-
-def pearson_corr(a: str | Expr, b: str | Expr, ddof: int = 1) -> Expr:
-    """
-    Compute the pearson's correlation between two columns.
-
-    .. deprecated:: 0.16.10
-        ``pearson_corr`` will be removed in favor of ``corr(..., method="pearson")``.
-
-    Parameters
-    ----------
-    a
-        Column name or Expression.
-    b
-        Column name or Expression.
-    ddof
-        “Delta Degrees of Freedom”: the divisor used in the calculation is N - ddof,
-        where N represents the number of elements.
-        By default ddof is 1.
-
-    See Also
-    --------
-    corr
-
-    Examples
-    --------
-    >>> df = pl.DataFrame({"a": [1, 8, 3], "b": [4, 5, 2], "c": ["foo", "bar", "foo"]})
-    >>> df.select(pl.pearson_corr("a", "b"))  # doctest: +SKIP
-    shape: (1, 1)
-    ┌──────────┐
-    │ a        │
-    │ ---      │
-    │ f64      │
-    ╞══════════╡
-    │ 0.544705 │
-    └──────────┘
-    """
-    warnings.warn(
-        "`pearson_corr()` is deprecated in favor of `corr()`",
-        DeprecationWarning,
-        stacklevel=find_stacklevel(),
-    )
-    if isinstance(a, str):
-        a = col(a)
-    if isinstance(b, str):
-        b = col(b)
-    return wrap_expr(plr.pearson_corr(a._pyexpr, b._pyexpr, ddof))
-
-
 def corr(
     a: str | Expr,
     b: str | Expr,
@@ -1508,7 +996,7 @@ def corr(
     propagate_nans: bool = False,
 ) -> Expr:
     """
-    Compute the pearson's or spearman rank correlation correlation between two columns.
+    Compute the Pearson's or Spearman rank correlation correlation between two columns.
 
     Parameters
     ----------
@@ -1517,7 +1005,7 @@ def corr(
     b
         Column name or Expression.
     ddof
-        “Delta Degrees of Freedom”: the divisor used in the calculation is N - ddof,
+        "Delta Degrees of Freedom": the divisor used in the calculation is N - ddof,
         where N represents the number of elements.
         By default ddof is 1.
     method : {'pearson', 'spearman'}
@@ -1550,7 +1038,7 @@ def corr(
     ┌─────┐
     │ a   │
     │ --- │
-    │ f64 │
+    │ f32 │
     ╞═════╡
     │ 0.5 │
     └─────┘
@@ -1658,7 +1146,7 @@ def map(
     │ 4   ┆ 7   ┆ 12    │
     └─────┴─────┴───────┘
     """
-    exprs = selection_to_pyexpr_list(exprs)
+    exprs = parse_as_list_of_expressions(exprs)
     return wrap_expr(
         plr.map_mul(
             exprs, function, return_dtype, apply_groups=False, returns_scalar=False
@@ -1675,6 +1163,10 @@ def apply(
 ) -> Expr:
     """
     Apply a custom/user-defined function (UDF) in a GroupBy context.
+
+    .. warning::
+        This method is much slower than the native expressions API.
+        Only use it if you cannot implement your logic otherwise.
 
     Depending on the context it has the following behavior:
 
@@ -1735,7 +1227,7 @@ def apply(
     │ 4   ┆ 7   ┆ 16        │
     └─────┴─────┴───────────┘
     """
-    exprs = selection_to_pyexpr_list(exprs)
+    exprs = parse_as_list_of_expressions(exprs)
     return wrap_expr(
         plr.map_mul(
             exprs,
@@ -1847,12 +1339,12 @@ def fold(
     └─────┴─────┘
     """
     # in case of pl.col("*")
-    acc = expr_to_lit_or_expr(acc, str_to_lit=True)
+    acc = parse_as_expression(acc, str_as_lit=True)
     if isinstance(exprs, pl.Expr):
         exprs = [exprs]
 
-    exprs = selection_to_pyexpr_list(exprs)
-    return wrap_expr(plr.fold(acc._pyexpr, function, exprs))
+    exprs = parse_as_list_of_expressions(exprs)
+    return wrap_expr(plr.fold(acc, function, exprs))
 
 
 def reduce(
@@ -1915,7 +1407,7 @@ def reduce(
     if isinstance(exprs, pl.Expr):
         exprs = [exprs]
 
-    exprs = selection_to_pyexpr_list(exprs)
+    exprs = parse_as_list_of_expressions(exprs)
     return wrap_expr(plr.reduce(function, exprs))
 
 
@@ -1988,12 +1480,12 @@ def cumfold(
 
     """  # noqa: W505
     # in case of pl.col("*")
-    acc = expr_to_lit_or_expr(acc, str_to_lit=True)
+    acc = parse_as_expression(acc, str_as_lit=True)
     if isinstance(exprs, pl.Expr):
         exprs = [exprs]
 
-    exprs = selection_to_pyexpr_list(exprs)
-    return wrap_expr(plr.cumfold(acc._pyexpr, function, exprs, include_init))
+    exprs = parse_as_list_of_expressions(exprs)
+    return wrap_expr(plr.cumfold(acc, function, exprs, include_init))
 
 
 def cumreduce(
@@ -2054,193 +1546,8 @@ def cumreduce(
     if isinstance(exprs, pl.Expr):
         exprs = [exprs]
 
-    exprs = selection_to_pyexpr_list(exprs)
+    exprs = parse_as_list_of_expressions(exprs)
     return wrap_expr(plr.cumreduce(function, exprs))
-
-
-@overload
-def any(exprs: Series) -> bool:  # type: ignore[misc]
-    ...
-
-
-@overload
-def any(exprs: IntoExpr | Iterable[IntoExpr], *more_exprs: IntoExpr) -> Expr:
-    ...
-
-
-@deprecated_alias(columns="exprs")
-def any(exprs: IntoExpr | Iterable[IntoExpr], *more_exprs: IntoExpr) -> Expr | bool:
-    """
-    Evaluate a bitwise OR operation.
-
-    If a single string is passed, this is an alias for ``pl.col(name).any()``.
-    If a single Series is passed, this is an alias for ``Series.any()``.
-
-    Otherwise, this function computes the bitwise OR horizontally across multiple
-    columns.
-
-    Parameters
-    ----------
-    exprs
-        Column(s) to use in the aggregation. Accepts expression input. Strings are
-        parsed as column names, other non-expression inputs are parsed as literals.
-    *more_exprs
-        Additional columns to use in the aggregation, specified as positional arguments.
-
-    Examples
-    --------
-    >>> df = pl.DataFrame(
-    ...     {
-    ...         "a": [True, False, True],
-    ...         "b": [False, False, False],
-    ...         "c": [False, True, False],
-    ...     }
-    ... )
-    >>> df
-    shape: (3, 3)
-    ┌───────┬───────┬───────┐
-    │ a     ┆ b     ┆ c     │
-    │ ---   ┆ ---   ┆ ---   │
-    │ bool  ┆ bool  ┆ bool  │
-    ╞═══════╪═══════╪═══════╡
-    │ true  ┆ false ┆ false │
-    │ false ┆ false ┆ true  │
-    │ true  ┆ false ┆ false │
-    └───────┴───────┴───────┘
-
-    Compares the values (in binary format) and return true if any value in the column
-    is true.
-
-    >>> df.select(pl.any("*"))
-    shape: (1, 3)
-    ┌──────┬───────┬──────┐
-    │ a    ┆ b     ┆ c    │
-    │ ---  ┆ ---   ┆ ---  │
-    │ bool ┆ bool  ┆ bool │
-    ╞══════╪═══════╪══════╡
-    │ true ┆ false ┆ true │
-    └──────┴───────┴──────┘
-
-    Across multiple columns:
-
-    >>> df.select(pl.any("a", "b"))
-    shape: (3, 1)
-    ┌───────┐
-    │ any   │
-    │ ---   │
-    │ bool  │
-    ╞═══════╡
-    │ true  │
-    │ false │
-    │ true  │
-    └───────┘
-
-    """
-    if not more_exprs:
-        if isinstance(exprs, pl.Series):
-            return exprs.any()
-        elif isinstance(exprs, str):
-            return col(exprs).any()
-
-    exprs = selection_to_pyexpr_list(exprs)
-    if more_exprs:
-        exprs.extend(selection_to_pyexpr_list(more_exprs))
-
-    exprs_wrapped = [wrap_expr(e) for e in exprs]
-    return fold(
-        lit(False), lambda a, b: a.cast(bool) | b.cast(bool), exprs_wrapped
-    ).alias("any")
-
-
-@overload
-def all(exprs: Series) -> bool:  # type: ignore[misc]
-    ...
-
-
-@overload
-def all(
-    exprs: IntoExpr | Iterable[IntoExpr] | None = ..., *more_exprs: IntoExpr
-) -> Expr:
-    ...
-
-
-@deprecated_alias(columns="exprs")
-def all(
-    exprs: IntoExpr | Iterable[IntoExpr] | None = None, *more_exprs: IntoExpr
-) -> Expr | bool:
-    """
-    Either return an expression representing all columns, or evaluate a bitwise AND operation.
-
-    If no arguments are passed, this is an alias for ``pl.col("*")``.
-    If a single string is passed, this is an alias for ``pl.col(name).any()``.
-    If a single Series is passed, this is an alias for ``Series.any()``.
-
-    Otherwise, this function computes the bitwise AND horizontally across multiple
-    columns.
-
-    Parameters
-    ----------
-    exprs
-        Column(s) to use in the aggregation. Accepts expression input. Strings are
-        parsed as column names, other non-expression inputs are parsed as literals.
-    *more_exprs
-        Additional columns to use in the aggregation, specified as positional arguments.
-
-    Examples
-    --------
-    Selecting all columns and calculating the sum:
-
-    >>> df = pl.DataFrame(
-    ...     {"a": [1, 2, 3], "b": ["hello", "foo", "bar"], "c": [1, 1, 1]}
-    ... )
-    >>> df.select(pl.all().sum())
-    shape: (1, 3)
-    ┌─────┬──────┬─────┐
-    │ a   ┆ b    ┆ c   │
-    │ --- ┆ ---  ┆ --- │
-    │ i64 ┆ str  ┆ i64 │
-    ╞═════╪══════╪═════╡
-    │ 6   ┆ null ┆ 3   │
-    └─────┴──────┴─────┘
-
-    Bitwise AND across multiple columns:
-
-    >>> df = pl.DataFrame(
-    ...     {
-    ...         "a": [True, False, True],
-    ...         "b": [True, False, False],
-    ...         "c": [False, True, False],
-    ...     }
-    ... )
-    >>> df.select(pl.all("a", "b"))
-    shape: (3, 1)
-    ┌───────┐
-    │ all   │
-    │ ---   │
-    │ bool  │
-    ╞═══════╡
-    │ true  │
-    │ false │
-    │ false │
-    └───────┘
-
-    """  # noqa: W505
-    if not more_exprs:
-        if exprs is None:
-            return col("*")
-        elif isinstance(exprs, pl.Series):
-            return exprs.all()
-        elif isinstance(exprs, str):
-            return col(exprs).all()
-
-    exprs = selection_to_pyexpr_list(exprs)
-    if more_exprs:
-        exprs.extend(selection_to_pyexpr_list(more_exprs))
-
-    exprs_wrapped = [wrap_expr(e) for e in exprs]
-    return fold(
-        lit(True), lambda a, b: a.cast(bool) & b.cast(bool), exprs_wrapped
-    ).alias("all")
 
 
 def exclude(
@@ -2342,92 +1649,6 @@ def quantile(
     return col(column).quantile(quantile, interpolation)
 
 
-@overload
-def arange(
-    start: int | Expr | Series,
-    end: int | Expr | Series,
-    step: int = ...,
-    *,
-    eager: Literal[False],
-) -> Expr:
-    ...
-
-
-@overload
-def arange(
-    start: int | Expr | Series,
-    end: int | Expr | Series,
-    step: int = ...,
-    *,
-    eager: Literal[True],
-    dtype: PolarsDataType | None = ...,
-) -> Series:
-    ...
-
-
-@overload
-def arange(
-    start: int | Expr | Series,
-    end: int | Expr | Series,
-    step: int = ...,
-    *,
-    eager: bool = ...,
-    dtype: PolarsDataType | None = ...,
-) -> Expr | Series:
-    ...
-
-
-@deprecated_alias(low="start", high="end")
-def arange(
-    start: int | Expr | Series,
-    end: int | Expr | Series,
-    step: int = 1,
-    *,
-    eager: bool = False,
-    dtype: PolarsDataType | None = None,
-) -> Expr | Series:
-    """
-    Create a range expression (or Series).
-
-    This can be used in a `select`, `with_column` etc. Be sure that the resulting
-    range size is equal to the length of the DataFrame you are collecting.
-
-    Examples
-    --------
-    >>> df.lazy().filter(pl.col("foo") < pl.arange(0, 100)).collect()  # doctest: +SKIP
-
-    Parameters
-    ----------
-    start
-        Lower bound of range.
-    end
-        Upper bound of range.
-    step
-        Step size of the range.
-    eager
-        Evaluate immediately and return a ``Series``. If set to ``False`` (default),
-        return an expression instead.
-    dtype
-        Apply an explicit integer dtype to the resulting expression (default is Int64).
-
-    """
-    start = expr_to_lit_or_expr(start, str_to_lit=False)
-    end = expr_to_lit_or_expr(end, str_to_lit=False)
-    range_expr = wrap_expr(plr.arange(start._pyexpr, end._pyexpr, step))
-
-    if dtype is not None and dtype != Int64:
-        range_expr = range_expr.cast(dtype)
-    if not eager:
-        return range_expr
-    else:
-        return (
-            pl.DataFrame()
-            .select(range_expr)
-            .to_series()
-            .rename("arange", in_place=True)
-        )
-
-
 def arg_sort_by(
     exprs: IntoExpr | Iterable[IntoExpr],
     *more_exprs: IntoExpr,
@@ -2487,9 +1708,7 @@ def arg_sort_by(
     └─────┘
 
     """
-    exprs = selection_to_pyexpr_list(exprs)
-    if more_exprs:
-        exprs.extend(selection_to_pyexpr_list(more_exprs))
+    exprs = parse_as_list_of_expressions(exprs, *more_exprs)
 
     if isinstance(descending, bool):
         descending = [descending] * len(exprs)
@@ -2498,337 +1717,6 @@ def arg_sort_by(
             f"the length of `descending` ({len(descending)}) does not match the length of `exprs` ({len(exprs)})"
         )
     return wrap_expr(plr.arg_sort_by(exprs, descending))
-
-
-def duration(
-    *,
-    days: Expr | str | int | None = None,
-    seconds: Expr | str | int | None = None,
-    nanoseconds: Expr | str | int | None = None,
-    microseconds: Expr | str | int | None = None,
-    milliseconds: Expr | str | int | None = None,
-    minutes: Expr | str | int | None = None,
-    hours: Expr | str | int | None = None,
-    weeks: Expr | str | int | None = None,
-) -> Expr:
-    """
-    Create polars `Duration` from distinct time components.
-
-    Returns
-    -------
-    Expr of type `pl.Duration`
-
-    Examples
-    --------
-    >>> from datetime import datetime
-    >>> df = pl.DataFrame(
-    ...     {
-    ...         "dt": [datetime(2022, 1, 1), datetime(2022, 1, 2)],
-    ...         "add": [1, 2],
-    ...     }
-    ... )
-    >>> print(df)
-    shape: (2, 2)
-    ┌─────────────────────┬─────┐
-    │ dt                  ┆ add │
-    │ ---                 ┆ --- │
-    │ datetime[μs]        ┆ i64 │
-    ╞═════════════════════╪═════╡
-    │ 2022-01-01 00:00:00 ┆ 1   │
-    │ 2022-01-02 00:00:00 ┆ 2   │
-    └─────────────────────┴─────┘
-    >>> with pl.Config(tbl_width_chars=120):
-    ...     df.select(
-    ...         (pl.col("dt") + pl.duration(weeks="add")).alias("add_weeks"),
-    ...         (pl.col("dt") + pl.duration(days="add")).alias("add_days"),
-    ...         (pl.col("dt") + pl.duration(seconds="add")).alias("add_seconds"),
-    ...         (pl.col("dt") + pl.duration(milliseconds="add")).alias("add_millis"),
-    ...         (pl.col("dt") + pl.duration(hours="add")).alias("add_hours"),
-    ...     )
-    ...
-    shape: (2, 5)
-    ┌─────────────────────┬─────────────────────┬─────────────────────┬─────────────────────────┬─────────────────────┐
-    │ add_weeks           ┆ add_days            ┆ add_seconds         ┆ add_millis              ┆ add_hours           │
-    │ ---                 ┆ ---                 ┆ ---                 ┆ ---                     ┆ ---                 │
-    │ datetime[μs]        ┆ datetime[μs]        ┆ datetime[μs]        ┆ datetime[μs]            ┆ datetime[μs]        │
-    ╞═════════════════════╪═════════════════════╪═════════════════════╪═════════════════════════╪═════════════════════╡
-    │ 2022-01-08 00:00:00 ┆ 2022-01-02 00:00:00 ┆ 2022-01-01 00:00:01 ┆ 2022-01-01 00:00:00.001 ┆ 2022-01-01 01:00:00 │
-    │ 2022-01-16 00:00:00 ┆ 2022-01-04 00:00:00 ┆ 2022-01-02 00:00:02 ┆ 2022-01-02 00:00:00.002 ┆ 2022-01-02 02:00:00 │
-    └─────────────────────┴─────────────────────┴─────────────────────┴─────────────────────────┴─────────────────────┘
-
-    """  # noqa: W505
-    if hours is not None:
-        hours = expr_to_lit_or_expr(hours, str_to_lit=False)._pyexpr
-    if minutes is not None:
-        minutes = expr_to_lit_or_expr(minutes, str_to_lit=False)._pyexpr
-    if seconds is not None:
-        seconds = expr_to_lit_or_expr(seconds, str_to_lit=False)._pyexpr
-    if milliseconds is not None:
-        milliseconds = expr_to_lit_or_expr(milliseconds, str_to_lit=False)._pyexpr
-    if microseconds is not None:
-        microseconds = expr_to_lit_or_expr(microseconds, str_to_lit=False)._pyexpr
-    if nanoseconds is not None:
-        nanoseconds = expr_to_lit_or_expr(nanoseconds, str_to_lit=False)._pyexpr
-    if days is not None:
-        days = expr_to_lit_or_expr(days, str_to_lit=False)._pyexpr
-    if weeks is not None:
-        weeks = expr_to_lit_or_expr(weeks, str_to_lit=False)._pyexpr
-
-    return wrap_expr(
-        plr.duration(
-            days,
-            seconds,
-            nanoseconds,
-            microseconds,
-            milliseconds,
-            minutes,
-            hours,
-            weeks,
-        )
-    )
-
-
-def datetime_(
-    year: Expr | str | int,
-    month: Expr | str | int,
-    day: Expr | str | int,
-    hour: Expr | str | int | None = None,
-    minute: Expr | str | int | None = None,
-    second: Expr | str | int | None = None,
-    microsecond: Expr | str | int | None = None,
-) -> Expr:
-    """
-    Create a Polars literal expression of type Datetime.
-
-    Parameters
-    ----------
-    year
-        column or literal.
-    month
-        column or literal, ranging from 1-12.
-    day
-        column or literal, ranging from 1-31.
-    hour
-        column or literal, ranging from 1-23.
-    minute
-        column or literal, ranging from 1-59.
-    second
-        column or literal, ranging from 1-59.
-    microsecond
-        column or literal, ranging from 1-999999.
-
-    Returns
-    -------
-    Expr of type `pl.Datetime`
-
-    """
-    year_expr = expr_to_lit_or_expr(year, str_to_lit=False)
-    month_expr = expr_to_lit_or_expr(month, str_to_lit=False)
-    day_expr = expr_to_lit_or_expr(day, str_to_lit=False)
-
-    if hour is not None:
-        hour = expr_to_lit_or_expr(hour, str_to_lit=False)._pyexpr
-    if minute is not None:
-        minute = expr_to_lit_or_expr(minute, str_to_lit=False)._pyexpr
-    if second is not None:
-        second = expr_to_lit_or_expr(second, str_to_lit=False)._pyexpr
-    if microsecond is not None:
-        microsecond = expr_to_lit_or_expr(microsecond, str_to_lit=False)._pyexpr
-
-    return wrap_expr(
-        plr.datetime(
-            year_expr._pyexpr,
-            month_expr._pyexpr,
-            day_expr._pyexpr,
-            hour,
-            minute,
-            second,
-            microsecond,
-        )
-    )
-
-
-def date_(
-    year: Expr | str | int,
-    month: Expr | str | int,
-    day: Expr | str | int,
-) -> Expr:
-    """
-    Create a Polars literal expression of type Date.
-
-    Parameters
-    ----------
-    year
-        column or literal.
-    month
-        column or literal, ranging from 1-12.
-    day
-        column or literal, ranging from 1-31.
-
-    Returns
-    -------
-    Expr of type pl.Date
-
-    """
-    return datetime_(year, month, day).cast(Date).alias("date")
-
-
-def concat_str(
-    exprs: IntoExpr | Iterable[IntoExpr],
-    *more_exprs: IntoExpr,
-    separator: str = "",
-) -> Expr:
-    """
-    Horizontally concatenate columns into a single string column.
-
-    Operates in linear time.
-
-    Parameters
-    ----------
-    exprs
-        Columns to concatenate into a single string column. Accepts expression input.
-        Strings are parsed as column names, other non-expression inputs are parsed as
-        literals. Non-``Utf8`` columns are cast to ``Utf8``.
-    *more_exprs
-        Additional columns to concatenate into a single string column, specified as
-        positional arguments.
-    separator
-        String that will be used to separate the values of each column.
-
-    Examples
-    --------
-    >>> df = pl.DataFrame(
-    ...     {
-    ...         "a": [1, 2, 3],
-    ...         "b": ["dogs", "cats", None],
-    ...         "c": ["play", "swim", "walk"],
-    ...     }
-    ... )
-    >>> df.with_columns(
-    ...     pl.concat_str(
-    ...         [
-    ...             pl.col("a") * 2,
-    ...             pl.col("b"),
-    ...             pl.col("c"),
-    ...         ],
-    ...         separator=" ",
-    ...     ).alias("full_sentence"),
-    ... )
-    shape: (3, 4)
-    ┌─────┬──────┬──────┬───────────────┐
-    │ a   ┆ b    ┆ c    ┆ full_sentence │
-    │ --- ┆ ---  ┆ ---  ┆ ---           │
-    │ i64 ┆ str  ┆ str  ┆ str           │
-    ╞═════╪══════╪══════╪═══════════════╡
-    │ 1   ┆ dogs ┆ play ┆ 2 dogs play   │
-    │ 2   ┆ cats ┆ swim ┆ 4 cats swim   │
-    │ 3   ┆ null ┆ walk ┆ null          │
-    └─────┴──────┴──────┴───────────────┘
-
-    """
-    exprs = selection_to_pyexpr_list(exprs)
-    if more_exprs:
-        exprs.extend(selection_to_pyexpr_list(more_exprs))
-    return wrap_expr(plr.concat_str(exprs, separator))
-
-
-def format(f_string: str, *args: Expr | str) -> Expr:
-    """
-    Format expressions as a string.
-
-    Parameters
-    ----------
-    f_string
-        A string that with placeholders.
-        For example: "hello_{}" or "{}_world
-    args
-        Expression(s) that fill the placeholders
-
-    Examples
-    --------
-    >>> df = pl.DataFrame(
-    ...     {
-    ...         "a": ["a", "b", "c"],
-    ...         "b": [1, 2, 3],
-    ...     }
-    ... )
-    >>> df.select(
-    ...     [
-    ...         pl.format("foo_{}_bar_{}", pl.col("a"), "b").alias("fmt"),
-    ...     ]
-    ... )
-    shape: (3, 1)
-    ┌─────────────┐
-    │ fmt         │
-    │ ---         │
-    │ str         │
-    ╞═════════════╡
-    │ foo_a_bar_1 │
-    │ foo_b_bar_2 │
-    │ foo_c_bar_3 │
-    └─────────────┘
-
-    """
-    if f_string.count("{}") != len(args):
-        raise ValueError("number of placeholders should equal the number of arguments")
-
-    exprs = []
-
-    arguments = iter(args)
-    for i, s in enumerate(f_string.split("{}")):
-        if i > 0:
-            e = expr_to_lit_or_expr(next(arguments), str_to_lit=False)
-            exprs.append(e)
-
-        if len(s) > 0:
-            exprs.append(lit(s))
-
-    return concat_str(exprs, separator="")
-
-
-def concat_list(exprs: IntoExpr | Iterable[IntoExpr], *more_exprs: IntoExpr) -> Expr:
-    """
-    Horizontally concatenate columns into a single list column.
-
-    Operates in linear time.
-
-    Parameters
-    ----------
-    exprs
-        Columns to concatenate into a single list column. Accepts expression input.
-        Strings are parsed as column names, other non-expression inputs are parsed as
-        literals.
-    *more_exprs
-        Additional columns to concatenate into a single list column, specified as
-        positional arguments.
-
-    Examples
-    --------
-    Create lagged columns and collect them into a list. This mimics a rolling window.
-
-    >>> df = pl.DataFrame({"A": [1.0, 2.0, 9.0, 2.0, 13.0]})
-    >>> df = df.select([pl.col("A").shift(i).alias(f"A_lag_{i}") for i in range(3)])
-    >>> df.select(
-    ...     pl.concat_list([f"A_lag_{i}" for i in range(3)][::-1]).alias("A_rolling")
-    ... )
-    shape: (5, 1)
-    ┌───────────────────┐
-    │ A_rolling         │
-    │ ---               │
-    │ list[f64]         │
-    ╞═══════════════════╡
-    │ [null, null, 1.0] │
-    │ [null, 1.0, 2.0]  │
-    │ [1.0, 2.0, 9.0]   │
-    │ [2.0, 9.0, 2.0]   │
-    │ [9.0, 2.0, 13.0]  │
-    └───────────────────┘
-
-    """
-    exprs = selection_to_pyexpr_list(exprs)
-    if more_exprs:
-        exprs.extend(selection_to_pyexpr_list(more_exprs))
-    return wrap_expr(plr.concat_list(exprs))
 
 
 def collect_all(
@@ -2902,11 +1790,7 @@ def collect_all(
     return result
 
 
-def select(
-    exprs: IntoExpr | Iterable[IntoExpr] | None = None,
-    *more_exprs: IntoExpr,
-    **named_exprs: IntoExpr,
-) -> DataFrame:
+def select(*exprs: IntoExpr | Iterable[IntoExpr], **named_exprs: IntoExpr) -> DataFrame:
     """
     Run polars expressions without a context.
 
@@ -2914,13 +1798,13 @@ def select(
 
     Parameters
     ----------
-    exprs
-        Expression or expressions to run.
-    *more_exprs
-        Additional expressions to run, specified as positional arguments.
+    *exprs
+        Column(s) to select, specified as positional arguments.
+        Accepts expression input. Strings are parsed as column names,
+        other non-expression inputs are parsed as literals.
     **named_exprs
-        Additional expressions to run, specified as keyword arguments. The expressions
-        will be renamed to the keyword used.
+        Additional columns to select, specified as keyword arguments.
+        The columns will be renamed to the keyword used.
 
     Returns
     -------
@@ -2930,7 +1814,7 @@ def select(
     --------
     >>> foo = pl.Series("foo", [1, 2, 3])
     >>> bar = pl.Series("bar", [3, 2, 1])
-    >>> pl.select(pl.min([foo, bar]))
+    >>> pl.select(pl.min_horizontal(foo, bar))
     shape: (3, 1)
     ┌─────┐
     │ min │
@@ -2943,203 +1827,7 @@ def select(
     └─────┘
 
     """
-    return pl.DataFrame().select(exprs, *more_exprs, **named_exprs)
-
-
-@overload
-def struct(
-    exprs: IntoExpr | Iterable[IntoExpr] = ...,
-    *more_exprs: IntoExpr,
-    eager: Literal[False] = ...,
-    schema: SchemaDict | None = ...,
-    **named_exprs: IntoExpr,
-) -> Expr:
-    ...
-
-
-@overload
-def struct(
-    exprs: IntoExpr | Iterable[IntoExpr] = ...,
-    *more_exprs: IntoExpr,
-    eager: Literal[True],
-    schema: SchemaDict | None = ...,
-    **named_exprs: IntoExpr,
-) -> Series:
-    ...
-
-
-@overload
-def struct(
-    exprs: IntoExpr | Iterable[IntoExpr] = ...,
-    *more_exprs: IntoExpr,
-    eager: bool,
-    schema: SchemaDict | None = ...,
-    **named_exprs: IntoExpr,
-) -> Expr | Series:
-    ...
-
-
-def struct(
-    exprs: IntoExpr | Iterable[IntoExpr] = None,
-    *more_exprs: IntoExpr,
-    eager: bool = False,
-    schema: SchemaDict | None = None,
-    **named_exprs: IntoExpr,
-) -> Expr | Series:
-    """
-    Collect columns into a struct column.
-
-    Parameters
-    ----------
-    exprs
-        Column(s) to collect into a struct column. Accepts expression input. Strings are
-        parsed as column names, other non-expression inputs are parsed as literals.
-    *more_exprs
-        Additional columns to collect into the struct column, specified as positional
-        arguments.
-    eager
-        Evaluate immediately and return a ``Series``. If set to ``False`` (default),
-        return an expression instead.
-    schema
-        Optional schema that explicitly defines the struct field dtypes.
-    **named_exprs
-        Additional columns to collect into the struct column, specified as keyword
-        arguments. The columns will be renamed to the keyword used.
-
-    Examples
-    --------
-    Collect all columns of a dataframe into a struct by passing ``pl.all()``.
-
-    >>> df = pl.DataFrame(
-    ...     {
-    ...         "int": [1, 2],
-    ...         "str": ["a", "b"],
-    ...         "bool": [True, None],
-    ...         "list": [[1, 2], [3]],
-    ...     }
-    ... )
-    >>> df.select(pl.struct(pl.all()).alias("my_struct"))
-    shape: (2, 1)
-    ┌─────────────────────┐
-    │ my_struct           │
-    │ ---                 │
-    │ struct[4]           │
-    ╞═════════════════════╡
-    │ {1,"a",true,[1, 2]} │
-    │ {2,"b",null,[3]}    │
-    └─────────────────────┘
-
-    Collect selected columns into a struct by either passing a list of columns, or by
-    specifying each column as a positional argument.
-
-    >>> df.select(pl.struct("int", False).alias("my_struct"))
-    shape: (2, 1)
-    ┌───────────┐
-    │ my_struct │
-    │ ---       │
-    │ struct[2] │
-    ╞═══════════╡
-    │ {1,false} │
-    │ {2,false} │
-    └───────────┘
-
-    Use keyword arguments to easily name each struct field.
-
-    >>> df.select(pl.struct(p="int", q="bool").alias("my_struct")).schema
-    {'my_struct': Struct([Field('p', Int64), Field('q', Boolean)])}
-
-    """
-    exprs = selection_to_pyexpr_list(exprs)
-    if more_exprs:
-        exprs.extend(selection_to_pyexpr_list(more_exprs))
-    if named_exprs:
-        exprs.extend(
-            expr_to_lit_or_expr(expr, name=name, str_to_lit=False)._pyexpr
-            for name, expr in named_exprs.items()
-        )
-
-    expr = wrap_expr(plr.as_struct(exprs))
-    if schema:
-        expr = expr.cast(Struct(schema), strict=False)
-
-    if eager:
-        return select(expr).to_series()
-    else:
-        return expr
-
-
-@overload
-def repeat(
-    value: float | int | str | bool | None,
-    n: Expr | int,
-    *,
-    eager: Literal[False] = ...,
-    name: str | None = ...,
-) -> Expr:
-    ...
-
-
-@overload
-def repeat(
-    value: float | int | str | bool | None,
-    n: Expr | int,
-    *,
-    eager: Literal[True],
-    name: str | None = ...,
-) -> Series:
-    ...
-
-
-@overload
-def repeat(
-    value: float | int | str | bool | None,
-    n: Expr | int,
-    *,
-    eager: bool,
-    name: str | None,
-) -> Expr | Series:
-    ...
-
-
-def repeat(
-    value: float | int | str | bool | None,
-    n: Expr | int,
-    *,
-    eager: bool = False,
-    name: str | None = None,
-) -> Expr | Series:
-    """
-    Repeat a single value n times.
-
-    Parameters
-    ----------
-    value
-        Value to repeat.
-    n
-        repeat `n` times
-    eager
-        Evaluate immediately and return a ``Series``. If set to ``False`` (default),
-        return an expression instead.
-    name
-        Only used in `eager` mode. As expression, use `alias`
-
-    """
-    if eager:
-        if name is None:
-            name = ""
-        dtype = py_type_to_dtype(type(value))
-        if (
-            dtype == Int64
-            and isinstance(value, int)
-            and -(2**31) <= value <= 2**31 - 1
-        ):
-            dtype = Int32
-        s = pl.Series._repeat(name, value, n, dtype)  # type: ignore[arg-type]
-        return s
-    else:
-        if isinstance(n, int):
-            n = lit(n)
-        return wrap_expr(plr.repeat(value, n._pyexpr))
+    return pl.DataFrame().select(*exprs, **named_exprs)
 
 
 @overload
@@ -3197,8 +1885,8 @@ def arg_where(condition: Expr | Series, *, eager: bool = False) -> Expr | Series
             )
         return condition.to_frame().select(arg_where(col(condition.name))).to_series()
     else:
-        condition = expr_to_lit_or_expr(condition, str_to_lit=True)
-        return wrap_expr(plr.arg_where(condition._pyexpr))
+        condition = parse_as_expression(condition)
+        return wrap_expr(plr.arg_where(condition))
 
 
 def coalesce(exprs: IntoExpr | Iterable[IntoExpr], *more_exprs: IntoExpr) -> Expr:
@@ -3248,9 +1936,7 @@ def coalesce(exprs: IntoExpr | Iterable[IntoExpr], *more_exprs: IntoExpr) -> Exp
     └──────┴──────┴──────┴──────┘
 
     """
-    exprs = selection_to_pyexpr_list(exprs)
-    if more_exprs:
-        exprs.extend(selection_to_pyexpr_list(more_exprs))
+    exprs = parse_as_list_of_expressions(exprs, *more_exprs)
     return wrap_expr(plr.coalesce(exprs))
 
 
@@ -3340,6 +2026,9 @@ def rolling_cov(
     """
     Compute the rolling covariance between two columns/ expressions.
 
+    The window at a given row includes the row itself and the
+    `window_size - 1` elements before it.
+
     Parameters
     ----------
     a
@@ -3378,6 +2067,9 @@ def rolling_corr(
     """
     Compute the rolling correlation between two columns/ expressions.
 
+    The window at a given row includes the row itself and the
+    `window_size - 1` elements before it.
+
     Parameters
     ----------
     a
@@ -3403,3 +2095,59 @@ def rolling_corr(
     return wrap_expr(
         plr.rolling_corr(a._pyexpr, b._pyexpr, window_size, min_periods, ddof)
     )
+
+
+@overload
+def sql_expr(sql: str) -> Expr:  # type: ignore[misc]
+    ...
+
+
+@overload
+def sql_expr(sql: Sequence[str]) -> list[Expr]:
+    ...
+
+
+def sql_expr(sql: str | Sequence[str]) -> Expr | list[Expr]:
+    """
+    Parse one or more SQL expressions to polars expression(s).
+
+    Parameters
+    ----------
+    sql
+        One or more SQL expressions.
+
+    Examples
+    --------
+    Parse a single SQL expression:
+
+    >>> df = pl.DataFrame({"a": [2, 1]})
+    >>> expr = pl.sql_expr("MAX(a)")
+    >>> df.select(expr)
+    shape: (1, 1)
+    ┌─────┐
+    │ a   │
+    │ --- │
+    │ i64 │
+    ╞═════╡
+    │ 2   │
+    └─────┘
+
+    Parse multiple SQL expressions:
+
+    >>> df.with_columns(
+    ...     *pl.sql_expr(["POWER(a,a) AS a_a", "CAST(a AS TEXT) AS a_txt"]),
+    ... )
+    shape: (2, 3)
+    ┌─────┬─────┬───────┐
+    │ a   ┆ a_a ┆ a_txt │
+    │ --- ┆ --- ┆ ---   │
+    │ i64 ┆ f64 ┆ str   │
+    ╞═════╪═════╪═══════╡
+    │ 2   ┆ 4.0 ┆ 2     │
+    │ 1   ┆ 1.0 ┆ 1     │
+    └─────┴─────┴───────┘
+    """
+    if isinstance(sql, str):
+        return wrap_expr(plr.sql_expr(sql))
+    else:
+        return [wrap_expr(plr.sql_expr(q)) for q in sql]

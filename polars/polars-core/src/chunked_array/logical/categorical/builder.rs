@@ -3,8 +3,7 @@ use std::hash::{Hash, Hasher};
 
 use arrow::array::*;
 use hashbrown::hash_map::{Entry, RawEntryMut};
-use polars_arrow::trusted_len::PushUnchecked;
-use polars_utils::HashSingle;
+use polars_arrow::trusted_len::TrustedLenPush;
 
 use crate::datatypes::PlHashMap;
 use crate::frame::groupby::hashing::HASHMAP_INIT_SIZE;
@@ -93,12 +92,17 @@ impl RevMapping {
         !self.is_global()
     }
 
+    /// Get the categories in this RevMapping
+    pub fn get_categories(&self) -> &Utf8Array<i64> {
+        match self {
+            Self::Global(_, a, _) => a,
+            Self::Local(a) => a,
+        }
+    }
+
     /// Get the length of the [`RevMapping`]
     pub fn len(&self) -> usize {
-        match self {
-            Self::Global(_, a, _) => a.len(),
-            Self::Local(a) => a.len(),
-        }
+        self.get_categories().len()
     }
 
     /// Categorical to str
@@ -226,7 +230,7 @@ impl CategoricalChunkedBuilder<'_> {
 }
 impl<'a> CategoricalChunkedBuilder<'a> {
     fn push_impl(&mut self, s: &'a str, store_hashes: bool) {
-        let h = self.local_mapping.hasher().hash_single(s);
+        let h = self.local_mapping.hasher().hash_one(s);
         let key = StrHashLocal::new(s, h);
         let mut idx = self.local_mapping.len() as u32;
 
@@ -250,7 +254,7 @@ impl<'a> CategoricalChunkedBuilder<'a> {
 
     /// Check if this categorical already exists
     pub fn exits(&self, s: &str) -> bool {
-        let h = self.local_mapping.hasher().hash_single(s);
+        let h = self.local_mapping.hasher().hash_one(s);
         let key = StrHashLocal::new(s, h);
         self.local_mapping.contains_key(&key)
     }

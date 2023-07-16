@@ -19,10 +19,11 @@ pub use sum::*;
 pub use variance::*;
 
 use super::*;
+use crate::error::{polars_bail, PolarsResult};
 use crate::utils::CustomIterTools;
 
 pub trait RollingAggWindowNoNulls<'a, T: NativeType> {
-    fn new(slice: &'a [T], start: usize, end: usize) -> Self;
+    fn new(slice: &'a [T], start: usize, end: usize, params: DynArgs) -> Self;
 
     /// Update and recompute the window
     /// # Safety
@@ -36,7 +37,8 @@ pub(super) fn rolling_apply_agg_window<'a, Agg, T, Fo>(
     window_size: usize,
     min_periods: usize,
     det_offsets_fn: Fo,
-) -> ArrayRef
+    params: DynArgs,
+) -> PolarsResult<ArrayRef>
 where
     Fo: Fn(Idx, WindowSize, Len) -> (Start, End),
     Agg: RollingAggWindowNoNulls<'a, T>,
@@ -44,7 +46,7 @@ where
 {
     let len = values.len();
     let (start, end) = det_offsets_fn(0, window_size, len);
-    let mut agg_window = Agg::new(values, start, end);
+    let mut agg_window = Agg::new(values, start, end, params);
 
     let out = (0..len)
         .map(|idx| {
@@ -56,11 +58,11 @@ where
         .collect_trusted::<Vec<_>>();
 
     let validity = create_validity(min_periods, len, window_size, det_offsets_fn);
-    Box::new(PrimitiveArray::new(
+    Ok(Box::new(PrimitiveArray::new(
         T::PRIMITIVE.into(),
         out.into(),
         validity.map(|b| b.into()),
-    ))
+    )))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -81,7 +83,7 @@ pub(super) fn rolling_apply_weights<T, Fo, Fa>(
     det_offsets_fn: Fo,
     aggregator: Fa,
     weights: &[T],
-) -> ArrayRef
+) -> PolarsResult<ArrayRef>
 where
     T: NativeType,
     Fo: Fn(Idx, WindowSize, Len) -> (Start, End),
@@ -99,38 +101,30 @@ where
         .collect_trusted::<Vec<T>>();
 
     let validity = create_validity(min_periods, len, window_size, det_offsets_fn);
-    Box::new(PrimitiveArray::new(
+    Ok(Box::new(PrimitiveArray::new(
         DataType::from(T::PRIMITIVE),
         out.into(),
         validity.map(|b| b.into()),
-    ))
+    )))
 }
 
 fn compute_var_weights<T>(vals: &[T], weights: &[T]) -> T
 where
     T: Float + std::ops::AddAssign,
 {
-    let weighted_iter = vals.iter().zip(weights).map(|(x, y)| *x * *y);
+    // Assumes the weights have already been standardized to 1
+    debug_assert!(
+        weights.iter().fold(T::zero(), |acc, x| acc + *x) == T::one(),
+        "Rolling weighted variance Weights don't sum to 1"
+    );
+    let (wssq, wmean) = vals
+        .iter()
+        .zip(weights)
+        .fold((T::zero(), T::zero()), |(wssq, wsum), (&v, &w)| {
+            (wssq + v * v * w, wsum + v * w)
+        });
 
-    let mut sum = T::zero();
-    let mut sum_of_squares = T::zero();
-
-    for val in weighted_iter {
-        sum += val;
-        sum_of_squares += val * val;
-    }
-    let count = NumCast::from(vals.len()).unwrap();
-
-    let mean = sum / count;
-    // apply Bessel's correction
-    ((sum_of_squares / count) - mean * mean) / (count - T::one()) * count
-}
-
-pub(crate) fn compute_mean_weights<T>(values: &[T], weights: &[T]) -> T
-where
-    T: Float + std::iter::Sum<T>,
-{
-    values.iter().zip(weights).map(|(v, w)| *v * *w).sum::<T>() / T::from(values.len()).unwrap()
+    wssq - wmean * wmean
 }
 
 pub(crate) fn compute_sum_weights<T>(values: &[T], weights: &[T]) -> T

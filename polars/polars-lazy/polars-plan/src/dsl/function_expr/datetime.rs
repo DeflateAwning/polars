@@ -1,8 +1,9 @@
 #[cfg(feature = "timezones")]
 use chrono_tz::Tz;
 #[cfg(feature = "timezones")]
-use polars_core::utils::arrow::temporal_conversions::parse_offset;
-use polars_core::utils::arrow::temporal_conversions::SECONDS_IN_DAY;
+use polars_time::base_utc_offset as base_utc_offset_fn;
+#[cfg(feature = "timezones")]
+use polars_time::dst_offset as dst_offset_fn;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
@@ -35,16 +36,24 @@ pub enum TemporalFunction {
     MonthStart,
     #[cfg(feature = "date_offset")]
     MonthEnd,
+    #[cfg(feature = "timezones")]
+    BaseUtcOffset,
+    #[cfg(feature = "timezones")]
+    DSTOffset,
     Round(String, String),
     #[cfg(feature = "timezones")]
     CastTimezone(Option<TimeZone>, Option<bool>),
     #[cfg(feature = "timezones")]
     TzLocalize(TimeZone),
     DateRange {
-        name: String,
         every: Duration,
         closed: ClosedWindow,
+        time_unit: Option<TimeUnit>,
         tz: Option<TimeZone>,
+    },
+    TimeRange {
+        every: Duration,
+        closed: ClosedWindow,
     },
     Combine(TimeUnit),
 }
@@ -77,12 +86,17 @@ impl Display for TemporalFunction {
             MonthStart => "month_start",
             #[cfg(feature = "date_offset")]
             MonthEnd => "month_end",
+            #[cfg(feature = "timezones")]
+            BaseUtcOffset => "base_utc_offset",
+            #[cfg(feature = "timezones")]
+            DSTOffset => "dst_offset",
             Round(..) => "round",
             #[cfg(feature = "timezones")]
             CastTimezone(_, _) => "replace_timezone",
             #[cfg(feature = "timezones")]
             TzLocalize(_) => "tz_localize",
             DateRange { .. } => return write!(f, "date_range"),
+            TimeRange { .. } => return write!(f, "time_range"),
             Combine(_) => "combine",
         };
         write!(f, "dt.{s}")
@@ -133,11 +147,18 @@ pub(super) fn time(s: &Series) -> PolarsResult<Series> {
 pub(super) fn date(s: &Series) -> PolarsResult<Series> {
     match s.dtype() {
         #[cfg(feature = "timezones")]
-        DataType::Datetime(_, Some(_)) => s
-            .datetime()
-            .unwrap()
-            .replace_time_zone(None, None)?
-            .cast(&DataType::Date),
+        DataType::Datetime(_, Some(tz)) => {
+            let mut out = s
+                .datetime()
+                .unwrap()
+                .replace_time_zone(None, None)?
+                .cast(&DataType::Date)?;
+            if tz != "UTC" {
+                // DST transitions may not preserve sortedness.
+                out.set_sorted_flag(IsSorted::Not);
+            }
+            Ok(out)
+        }
         DataType::Datetime(_, _) => s.datetime().unwrap().cast(&DataType::Date),
         DataType::Date => Ok(s.clone()),
         dtype => polars_bail!(ComputeError: "expected Datetime or Date, got {}", dtype),
@@ -146,11 +167,18 @@ pub(super) fn date(s: &Series) -> PolarsResult<Series> {
 pub(super) fn datetime(s: &Series) -> PolarsResult<Series> {
     match s.dtype() {
         #[cfg(feature = "timezones")]
-        DataType::Datetime(tu, Some(_)) => s
-            .datetime()
-            .unwrap()
-            .replace_time_zone(None, None)?
-            .cast(&DataType::Datetime(*tu, None)),
+        DataType::Datetime(tu, Some(tz)) => {
+            let mut out = s
+                .datetime()
+                .unwrap()
+                .replace_time_zone(None, None)?
+                .cast(&DataType::Datetime(*tu, None))?;
+            if tz != "UTC" {
+                // DST transitions may not preserve sortedness.
+                out.set_sorted_flag(IsSorted::Not);
+            }
+            Ok(out)
+        }
         DataType::Datetime(tu, _) => s.datetime().unwrap().cast(&DataType::Datetime(*tu, None)),
         dtype => polars_bail!(ComputeError: "expected Datetime, got {}", dtype),
     }
@@ -180,37 +208,29 @@ pub(super) fn timestamp(s: &Series, tu: TimeUnit) -> PolarsResult<Series> {
 pub(super) fn truncate(s: &Series, every: &str, offset: &str) -> PolarsResult<Series> {
     let every = Duration::parse(every);
     let offset = Duration::parse(offset);
-    Ok(match s.dtype() {
+    let mut out = match s.dtype() {
         DataType::Datetime(_, tz) => match tz {
             #[cfg(feature = "timezones")]
-            Some(tz) => match tz.parse::<Tz>() {
-                Ok(tz) => s
-                    .datetime()
-                    .unwrap()
-                    .truncate(every, offset, Some(&tz))?
-                    .into_series(),
-                Err(_) => match parse_offset(tz) {
-                    Ok(tz) => s
-                        .datetime()
-                        .unwrap()
-                        .truncate(every, offset, Some(&tz))?
-                        .into_series(),
-                    Err(_) => unreachable!(),
-                },
-            },
+            Some(tz) => s
+                .datetime()
+                .unwrap()
+                .truncate(every, offset, tz.parse::<Tz>().ok().as_ref())?
+                .into_series(),
             _ => s
                 .datetime()
                 .unwrap()
-                .truncate(every, offset, NO_TIMEZONE)?
+                .truncate(every, offset, None)?
                 .into_series(),
         },
         DataType::Date => s
             .date()
             .unwrap()
-            .truncate(every, offset, NO_TIMEZONE)?
+            .truncate(every, offset, None)?
             .into_series(),
         dt => polars_bail!(opq = round, got = dt, expected = "date/datetime"),
-    })
+    };
+    out.set_sorted_flag(s.is_sorted_flag());
+    Ok(out)
 }
 
 #[cfg(feature = "date_offset")]
@@ -218,20 +238,14 @@ pub(super) fn month_start(s: &Series) -> PolarsResult<Series> {
     Ok(match s.dtype() {
         DataType::Datetime(_, tz) => match tz {
             #[cfg(feature = "timezones")]
-            Some(tz) => match tz.parse::<Tz>() {
-                Ok(tz) => s.datetime().unwrap().month_start(Some(&tz))?.into_series(),
-                Err(_) => match parse_offset(tz) {
-                    Ok(tz) => s.datetime().unwrap().month_start(Some(&tz))?.into_series(),
-                    Err(_) => unreachable!(),
-                },
-            },
-            _ => s
+            Some(tz) => s
                 .datetime()
                 .unwrap()
-                .month_start(NO_TIMEZONE)?
+                .month_start(tz.parse::<Tz>().ok().as_ref())?
                 .into_series(),
+            _ => s.datetime().unwrap().month_start(None)?.into_series(),
         },
-        DataType::Date => s.date().unwrap().month_start(NO_TIMEZONE)?.into_series(),
+        DataType::Date => s.date().unwrap().month_start(None)?.into_series(),
         dt => polars_bail!(opq = month_start, got = dt, expected = "date/datetime"),
     })
 }
@@ -241,18 +255,49 @@ pub(super) fn month_end(s: &Series) -> PolarsResult<Series> {
     Ok(match s.dtype() {
         DataType::Datetime(_, tz) => match tz {
             #[cfg(feature = "timezones")]
-            Some(tz) => match tz.parse::<Tz>() {
-                Ok(tz) => s.datetime().unwrap().month_end(Some(&tz))?.into_series(),
-                Err(_) => match parse_offset(tz) {
-                    Ok(tz) => s.datetime().unwrap().month_end(Some(&tz))?.into_series(),
-                    Err(_) => unreachable!(),
-                },
-            },
-            _ => s.datetime().unwrap().month_end(NO_TIMEZONE)?.into_series(),
+            Some(tz) => s
+                .datetime()
+                .unwrap()
+                .month_end(tz.parse::<Tz>().ok().as_ref())?
+                .into_series(),
+            _ => s.datetime().unwrap().month_end(None)?.into_series(),
         },
-        DataType::Date => s.date().unwrap().month_end(NO_TIMEZONE)?.into_series(),
+        DataType::Date => s.date().unwrap().month_end(None)?.into_series(),
         dt => polars_bail!(opq = month_end, got = dt, expected = "date/datetime"),
     })
+}
+
+#[cfg(feature = "timezones")]
+pub(super) fn base_utc_offset(s: &Series) -> PolarsResult<Series> {
+    match s.dtype() {
+        DataType::Datetime(time_unit, Some(tz)) => {
+            let tz = tz
+                .parse::<Tz>()
+                .expect("Time zone has already been validated");
+            Ok(base_utc_offset_fn(s.datetime().unwrap(), time_unit, &tz).into_series())
+        }
+        dt => polars_bail!(
+            opq = base_utc_offset,
+            got = dt,
+            expected = "time-zone-aware datetime"
+        ),
+    }
+}
+#[cfg(feature = "timezones")]
+pub(super) fn dst_offset(s: &Series) -> PolarsResult<Series> {
+    match s.dtype() {
+        DataType::Datetime(time_unit, Some(tz)) => {
+            let tz = tz
+                .parse::<Tz>()
+                .expect("Time zone has already been validated");
+            Ok(dst_offset_fn(s.datetime().unwrap(), time_unit, &tz).into_series())
+        }
+        dt => polars_bail!(
+            opq = dst_offset,
+            got = dt,
+            expected = "time-zone-aware datetime"
+        ),
+    }
 }
 
 pub(super) fn round(s: &Series, every: &str, offset: &str) -> PolarsResult<Series> {
@@ -261,32 +306,18 @@ pub(super) fn round(s: &Series, every: &str, offset: &str) -> PolarsResult<Serie
     Ok(match s.dtype() {
         DataType::Datetime(_, tz) => match tz {
             #[cfg(feature = "timezones")]
-            Some(tz) => match tz.parse::<Tz>() {
-                Ok(tz) => s
-                    .datetime()
-                    .unwrap()
-                    .round(every, offset, Some(&tz))?
-                    .into_series(),
-                Err(_) => match parse_offset(tz) {
-                    Ok(tz) => s
-                        .datetime()
-                        .unwrap()
-                        .round(every, offset, Some(&tz))?
-                        .into_series(),
-                    Err(_) => unreachable!(),
-                },
-            },
+            Some(tz) => s
+                .datetime()
+                .unwrap()
+                .round(every, offset, tz.parse::<Tz>().ok().as_ref())?
+                .into_series(),
             _ => s
                 .datetime()
                 .unwrap()
-                .round(every, offset, NO_TIMEZONE)?
+                .round(every, offset, None)?
                 .into_series(),
         },
-        DataType::Date => s
-            .date()
-            .unwrap()
-            .round(every, offset, NO_TIMEZONE)?
-            .into_series(),
+        DataType::Date => s.date().unwrap().round(every, offset, None)?.into_series(),
         dt => polars_bail!(opq = round, got = dt, expected = "date/datetime"),
     })
 }
@@ -313,123 +344,4 @@ pub(super) fn tz_localize(s: &Series, tz: &str) -> PolarsResult<Series> {
         (consider using 'dt.convert_time_zone' or 'dt.replace_time_zone')"
     );
     Ok(ca.replace_time_zone(Some(tz), None)?.into_series())
-}
-
-pub(super) fn date_range_dispatch(
-    s: &[Series],
-    name: &str,
-    every: Duration,
-    closed: ClosedWindow,
-    tz: Option<TimeZone>,
-) -> PolarsResult<Series> {
-    let start = &s[0];
-    let stop = &s[1];
-
-    polars_ensure!(
-        start.len() == stop.len(),
-        ComputeError: "'start' and 'stop' should have the same length",
-    );
-    const TO_MS: i64 = SECONDS_IN_DAY * 1000;
-
-    if start.len() == 1 && stop.len() == 1 {
-        match start.dtype() {
-            DataType::Date => {
-                let start = start.to_physical_repr();
-                let stop = stop.to_physical_repr();
-                // to milliseconds
-                let start = start.get(0).unwrap().extract::<i64>().unwrap() * TO_MS;
-                let stop = stop.get(0).unwrap().extract::<i64>().unwrap() * TO_MS;
-
-                date_range_impl(
-                    name,
-                    start,
-                    stop,
-                    every,
-                    closed,
-                    TimeUnit::Milliseconds,
-                    tz.as_ref(),
-                )?
-                .cast(&DataType::Date)
-            }
-            DataType::Datetime(tu, _) => {
-                let start = start.to_physical_repr();
-                let stop = stop.to_physical_repr();
-                let start = start.get(0).unwrap().extract::<i64>().unwrap();
-                let stop = stop.get(0).unwrap().extract::<i64>().unwrap();
-
-                Ok(
-                    date_range_impl(name, start, stop, every, closed, *tu, tz.as_ref())?
-                        .into_series(),
-                )
-            }
-            _ => unimplemented!(),
-        }
-    } else {
-        let dtype = start.dtype();
-
-        let mut start = start.to_physical_repr().cast(&DataType::Int64)?;
-        let mut stop = stop.to_physical_repr().cast(&DataType::Int64)?;
-
-        let (tu, tz) = match dtype {
-            DataType::Date => {
-                start = &start * TO_MS;
-                stop = &stop * TO_MS;
-                (TimeUnit::Milliseconds, None)
-            }
-            DataType::Datetime(tu, tz) => (*tu, tz.as_ref()),
-            _ => unimplemented!(),
-        };
-
-        let start = start.i64().unwrap();
-        let stop = stop.i64().unwrap();
-
-        let list = match dtype {
-            DataType::Date => {
-                let mut builder = ListPrimitiveChunkedBuilder::<Int32Type>::new(
-                    name,
-                    start.len(),
-                    start.len() * 5,
-                    DataType::Int32,
-                );
-                for (start, stop) in start.into_iter().zip(stop.into_iter()) {
-                    match (start, stop) {
-                        (Some(start), Some(stop)) => {
-                            let date_range =
-                                date_range_impl("", start, stop, every, closed, tu, tz)?;
-                            let date_range = date_range.cast(&DataType::Date).unwrap();
-                            let date_range = date_range.to_physical_repr();
-                            let date_range = date_range.i32().unwrap();
-                            builder.append_slice(date_range.cont_slice().unwrap())
-                        }
-                        _ => builder.append_null(),
-                    }
-                }
-                builder.finish().into_series()
-            }
-            DataType::Datetime(_, _) => {
-                let mut builder = ListPrimitiveChunkedBuilder::<Int64Type>::new(
-                    name,
-                    start.len(),
-                    start.len() * 5,
-                    DataType::Int64,
-                );
-
-                for (start, stop) in start.into_iter().zip(stop.into_iter()) {
-                    match (start, stop) {
-                        (Some(start), Some(stop)) => {
-                            let date_range =
-                                date_range_impl("", start, stop, every, closed, tu, tz)?;
-                            builder.append_slice(date_range.cont_slice().unwrap())
-                        }
-                        _ => builder.append_null(),
-                    }
-                }
-                builder.finish().into_series()
-            }
-            _ => unimplemented!(),
-        };
-
-        let to_type = DataType::List(Box::new(dtype.clone()));
-        list.cast(&to_type)
-    }
 }

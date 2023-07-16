@@ -1,7 +1,29 @@
-import typing
-
 import polars as pl
 from polars.testing import assert_frame_equal
+
+
+def test_comparison_order_null_broadcasting() -> None:
+    # see more: 8183
+    exprs = [
+        pl.col("v") < pl.col("null"),
+        pl.col("null") < pl.col("v"),
+        pl.col("v") <= pl.col("null"),
+        pl.col("null") <= pl.col("v"),
+        pl.col("v") > pl.col("null"),
+        pl.col("null") > pl.col("v"),
+        pl.col("v") >= pl.col("null"),
+        pl.col("null") >= pl.col("v"),
+    ]
+
+    kwargs = {f"out{i}": e for i, e in zip(range(len(exprs)), exprs)}
+
+    # single value, hits broadcasting branch
+    df = pl.DataFrame({"v": [42], "null": [None]})
+    assert all((df.select(**kwargs).null_count() == 1).rows()[0])
+
+    # multiple values, hits default branch
+    df = pl.DataFrame({"v": [42, 42], "null": [None, None]})
+    assert all((df.select(**kwargs).null_count() == 2).rows()[0])
 
 
 def test_comparison_nulls_single() -> None:
@@ -19,8 +41,8 @@ def test_comparison_nulls_single() -> None:
             "c": pl.Series([None], dtype=pl.Boolean),
         }
     )
-    assert (df1 == df2).row(0) == (True, True, True)
-    assert (df1 != df2).row(0) == (False, False, False)
+    assert (df1 == df2).row(0) == (None, None, None)
+    assert (df1 != df2).row(0) == (None, None, None)
 
 
 def test_comparison_series_expr() -> None:
@@ -98,7 +120,6 @@ def test_comparison_expr_series() -> None:
     )
 
 
-@typing.no_type_check
 def test_offset_handling_arg_where_7863() -> None:
     df_check = pl.DataFrame({"a": [0, 1]})
     df_check.select((pl.lit(0).append(pl.col("a")).append(0)) != 0)
@@ -108,3 +129,18 @@ def test_offset_handling_arg_where_7863() -> None:
         .item()
         == 2
     )
+
+
+def test_missing_equality_on_bools() -> None:
+    df = pl.DataFrame(
+        {
+            "a": [True, None, False],
+        }
+    )
+
+    assert df.select(pl.col("a").ne_missing(True))["a"].to_list() == [False, True, True]
+    assert df.select(pl.col("a").ne_missing(False))["a"].to_list() == [
+        True,
+        True,
+        False,
+    ]

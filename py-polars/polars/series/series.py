@@ -3,12 +3,13 @@ from __future__ import annotations
 import contextlib
 import math
 import os
-import typing
+import warnings
 from datetime import date, datetime, time, timedelta
 from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
+    ClassVar,
     Collection,
     Generator,
     Iterable,
@@ -27,6 +28,7 @@ from polars.datatypes import (
     SIGNED_INTEGER_DTYPES,
     TEMPORAL_DTYPES,
     UNSIGNED_INTEGER_DTYPES,
+    Array,
     Boolean,
     Categorical,
     Date,
@@ -42,8 +44,6 @@ from polars.datatypes import (
     List,
     Object,
     Time,
-    UInt8,
-    UInt16,
     UInt32,
     UInt64,
     Unknown,
@@ -65,6 +65,7 @@ from polars.dependencies import numpy as np
 from polars.dependencies import pandas as pd
 from polars.dependencies import pyarrow as pa
 from polars.exceptions import ShapeError
+from polars.series.array import ArrayNameSpace
 from polars.series.binary import BinaryNameSpace
 from polars.series.categorical import CatNameSpace
 from polars.series.datetime import DateTimeNameSpace
@@ -76,6 +77,7 @@ from polars.slice import PolarsSlice
 from polars.utils._construction import (
     arrow_to_pyseries,
     iterable_to_pyseries,
+    numpy_to_idxs,
     numpy_to_pyseries,
     pandas_to_pyseries,
     sequence_to_pyseries,
@@ -91,7 +93,7 @@ from polars.utils.decorators import deprecated_alias
 from polars.utils.meta import get_index_type
 from polars.utils.various import (
     _is_generator,
-    is_int_sequence,
+    find_stacklevel,
     parse_version,
     range_to_series,
     range_to_slice,
@@ -216,7 +218,15 @@ class Series:
     """
 
     _s: PySeries = None
-    _accessors: set[str] = {"arr", "cat", "dt", "str", "bin", "struct"}
+    _accessors: ClassVar[set[str]] = {
+        "arr",
+        "cat",
+        "dt",
+        "list",
+        "str",
+        "bin",
+        "struct",
+    }
 
     def __init__(
         self,
@@ -260,7 +270,7 @@ class Series:
             self._s = series_to_pyseries(name, values)
 
         elif isinstance(values, range):
-            self._s = range_to_series(name, values, dtype=dtype)._s
+            self._s = range_to_series(name, values, dtype=dtype)._s  # type: ignore[arg-type]
 
         elif isinstance(values, Sequence):
             self._s = sequence_to_pyseries(
@@ -325,7 +335,7 @@ class Series:
     def _from_pandas(
         cls,
         name: str,
-        values: pd.Series | pd.DatetimeIndex,
+        values: pd.Series[Any] | pd.DatetimeIndex,
         *,
         nan_to_null: bool = True,
     ) -> Self:
@@ -333,12 +343,6 @@ class Series:
         return cls._from_pyseries(
             pandas_to_pyseries(name, values, nan_to_null=nan_to_null)
         )
-
-    @classmethod
-    def _repeat(
-        cls, name: str, val: int | float | str | bool, n: int, dtype: PolarsDataType
-    ) -> Self:
-        return cls._from_pyseries(PySeries.repeat(name, val, n, dtype))
 
     def _get_ptr(self) -> int:
         """
@@ -407,6 +411,12 @@ class Series:
     @property
     def time_unit(self) -> TimeUnit | None:
         """Get the time unit of underlying Datetime Series as {"ns", "us", "ms"}."""
+        warnings.warn(
+            "`Series.time_unit` is deprecated and will be removed in a future version,"
+            " please use `Series.dtype.time_unit` instead",
+            category=DeprecationWarning,
+            stacklevel=find_stacklevel(),
+        )
         return self._s.time_unit()
 
     def __bool__(self) -> NoReturn:
@@ -466,7 +476,7 @@ class Series:
                 return ~self
 
         if isinstance(other, datetime) and self.dtype == Datetime:
-            ts = _datetime_to_pl_timestamp(other, self.time_unit)
+            ts = _datetime_to_pl_timestamp(other, self._s.time_unit())
             f = get_ffi_func(op + "_<>", Int64, self._s)
             assert f is not None
             return self._from_pyseries(f(ts))
@@ -489,7 +499,7 @@ class Series:
             return self._from_pyseries(getattr(self._s, op)(other._s))
 
         if other is not None:
-            other = maybe_cast(other, self.dtype, self.time_unit)
+            other = maybe_cast(other, self.dtype, self._s.time_unit())
         f = get_ffi_func(op + "_<>", self.dtype, self._s)
         if f is None:
             return NotImplemented
@@ -586,9 +596,51 @@ class Series:
         """Method equivalent of operator expression ``series == other``."""
         return self.__eq__(other)
 
+    @overload
+    def eq_missing(self, other: Any) -> Self:
+        ...
+
+    @overload
+    def eq_missing(self, other: Expr) -> Expr:  # type: ignore[misc]
+        ...
+
+    def eq_missing(self, other: Any) -> Self | Expr:
+        """
+        Method equivalent of equality operator ``expr == other`` where `None` == None`.
+
+        This differs from default ``ne`` where null values are propagated.
+
+        Parameters
+        ----------
+        other
+            A literal or expression value to compare with.
+
+        """
+
     def ne(self, other: Any) -> Self | Expr:
         """Method equivalent of operator expression ``series != other``."""
         return self.__ne__(other)
+
+    @overload
+    def ne_missing(self, other: Expr) -> Expr:  # type: ignore[misc]
+        ...
+
+    @overload
+    def ne_missing(self, other: Any) -> Self:
+        ...
+
+    def ne_missing(self, other: Any) -> Self | Expr:
+        """
+        Method equivalent of equality operator ``expr != other`` where `None` == None`.
+
+        This differs from default ``ne`` where null values are propagated.
+
+        Parameters
+        ----------
+        other
+            A literal or expression value to compare with.
+
+        """
 
     def ge(self, other: Any) -> Self | Expr:
         """Method equivalent of operator expression ``series >= other``."""
@@ -616,7 +668,7 @@ class Series:
             else:
                 return self._from_pyseries(getattr(self._s, op_s)(_s))
         else:
-            other = maybe_cast(other, self.dtype, self.time_unit)
+            other = maybe_cast(other, self.dtype, self._s.time_unit())
             f = get_ffi_func(op_ffi, self.dtype, self._s)
         if f is None:
             raise ValueError(
@@ -679,13 +731,20 @@ class Series:
 
         return self.cast(Float64) / other
 
-    # python 3.7 is not happy. Remove this when we finally ditch that
-    @typing.no_type_check
+    @overload
+    def __floordiv__(self, other: Expr) -> Expr:  # type: ignore[misc]
+        ...
+
+    @overload
     def __floordiv__(self, other: Any) -> Series:
+        ...
+
+    def __floordiv__(self, other: Any) -> Series | Expr:
         if isinstance(other, pl.Expr):
-            return F.lit(self).__floordiv__(other)
+            return F.lit(self) // other
         if self.is_temporal():
             raise ValueError("first cast to integer before dividing datelike dtypes")
+
         if not isinstance(other, pl.Expr):
             other = F.lit(other)
         return self.to_frame().select(F.col(self.name) // other).to_series()
@@ -769,7 +828,7 @@ class Series:
             raise ValueError("first cast to integer before multiplying datelike dtypes")
         return self._arithmetic(other, "mul", "mul_<>")
 
-    def __pow__(self, exponent: int | float | Series) -> Series:
+    def __pow__(self, exponent: int | float | None | Series) -> Series:
         return self.pow(exponent)
 
     def __rpow__(self, other: Any) -> Series:
@@ -810,6 +869,13 @@ class Series:
     def __deepcopy__(self, memo: None = None) -> Self:
         return self.clone()
 
+    def __contains__(self, item: Any) -> bool:
+        # TODO! optimize via `is_in` and `SORTED` flags
+        try:
+            return (self == item).any()
+        except ValueError:
+            return False
+
     def __iter__(self) -> Generator[Any, None, None]:
         if self.dtype == List:
             # TODO: either make a change and return py-native list data here, or find
@@ -823,92 +889,60 @@ class Series:
             for offset in range(0, self.len(), buffer_size):
                 yield from self.slice(offset, buffer_size).to_list()
 
-    def _pos_idxs(self, idxs: np.ndarray[Any, Any] | Series) -> Series:
+    def _pos_idxs(self, size: int) -> Series:
+        # Unsigned or signed Series (ordered from fastest to slowest).
+        #   - pl.UInt32 (polars) or pl.UInt64 (polars_u64_idx) Series indexes.
+        #   - Other unsigned Series indexes are converted to pl.UInt32 (polars)
+        #     or pl.UInt64 (polars_u64_idx).
+        #   - Signed Series indexes are converted pl.UInt32 (polars) or
+        #     pl.UInt64 (polars_u64_idx) after negative indexes are converted
+        #     to absolute indexes.
+
         # pl.UInt32 (polars) or pl.UInt64 (polars_u64_idx).
         idx_type = get_index_type()
 
-        if isinstance(idxs, Series):
-            if idxs.dtype == idx_type:
-                return idxs
-            if idxs.dtype in {
-                UInt8,
-                UInt16,
-                UInt64 if idx_type == UInt32 else UInt32,
-                Int8,
-                Int16,
-                Int32,
-                Int64,
-            }:
+        if self.dtype == idx_type:
+            return self
+
+        if self.dtype not in INTEGER_DTYPES:
+            raise NotImplementedError("Unsupported idxs datatype.")
+
+        if self.len() == 0:
+            return Series(self.name, [], dtype=idx_type)
+
+        if idx_type == UInt32:
+            if self.dtype in {Int64, UInt64}:
+                if self.max() >= 2**32:  # type: ignore[operator]
+                    raise ValueError("Index positions should be smaller than 2^32.")
+            if self.dtype == Int64:
+                if self.min() < -(2**32):  # type: ignore[operator]
+                    raise ValueError("Index positions should be bigger than -2^32 + 1.")
+
+        if self.dtype in SIGNED_INTEGER_DTYPES:
+            if self.min() < 0:  # type: ignore[operator]
                 if idx_type == UInt32:
-                    if idxs.dtype in {Int64, UInt64}:
-                        if idxs.max() >= 2**32:  # type: ignore[operator]
-                            raise ValueError(
-                                "Index positions should be smaller than 2^32."
-                            )
-                    if idxs.dtype == Int64:
-                        if idxs.min() < -(2**32):  # type: ignore[operator]
-                            raise ValueError(
-                                "Index positions should be bigger than -2^32 + 1."
-                            )
-                if idxs.dtype in SIGNED_INTEGER_DTYPES:
-                    if idxs.min() < 0:  # type: ignore[operator]
-                        if idx_type == UInt32:
-                            if idxs.dtype in {Int8, Int16}:
-                                idxs = idxs.cast(Int32)
-                        else:
-                            if idxs.dtype in {Int8, Int16, Int32}:
-                                idxs = idxs.cast(Int64)
+                    idxs = self.cast(Int32) if self.dtype in {Int8, Int16} else self
+                else:
+                    idxs = (
+                        self.cast(Int64) if self.dtype in {Int8, Int16, Int32} else self
+                    )
 
-                        # Update negative indexes to absolute indexes.
-                        return (
-                            idxs.to_frame()
-                            .select(
-                                F.when(F.col(idxs.name) < 0)
-                                .then(self.len() + F.col(idxs.name))
-                                .otherwise(F.col(idxs.name))
-                                .cast(idx_type)
-                            )
-                            .to_series(0)
-                        )
+                # Update negative indexes to absolute indexes.
+                return (
+                    idxs.to_frame()
+                    .select(
+                        F.when(F.col(idxs.name) < 0)
+                        .then(size + F.col(idxs.name))
+                        .otherwise(F.col(idxs.name))
+                        .cast(idx_type)
+                    )
+                    .to_series(0)
+                )
 
-                return idxs.cast(idx_type)
+        return self.cast(idx_type)
 
-        elif _check_for_numpy(idxs) and isinstance(idxs, np.ndarray):
-            if idxs.ndim != 1:
-                raise ValueError("Only 1D numpy array is supported as index.")
-            if idxs.dtype.kind in ("i", "u"):
-                # Numpy array with signed or unsigned integers.
-
-                if idx_type == UInt32:
-                    if idxs.dtype in {np.int64, np.uint64} and idxs.max() >= 2**32:
-                        raise ValueError("Index positions should be smaller than 2^32.")
-                    if idxs.dtype == np.int64 and idxs.min() < -(2**32):
-                        raise ValueError(
-                            "Index positions should be bigger than -2^32 + 1."
-                        )
-                if idxs.dtype.kind == "i":
-                    if idxs.min() < 0:
-                        if idx_type == UInt32:
-                            if idxs.dtype in (np.int8, np.int16):
-                                idxs = idxs.astype(np.int32)
-                        else:
-                            if idxs.dtype in (np.int8, np.int16, np.int32):
-                                idxs = idxs.astype(np.int64)
-
-                        # Update negative indexes to absolute indexes.
-                        idxs = np.where(idxs < 0, self.len() + idxs, idxs)
-
-                    # Cast signed numpy array to unsigned numpy array as all indexes
-                    # are positive and casting signed Polars Series to unsigned
-                    # Polars series is much slower.
-                    if isinstance(idxs, np.ndarray):
-                        idxs = idxs.astype(
-                            np.uint32 if idx_type == UInt32 else np.uint64
-                        )
-
-                return Series("", idxs, dtype=idx_type)
-
-        raise NotImplementedError("Unsupported idxs datatype.")
+    def _take_with_series(self, s: Series) -> Series:
+        return self._from_pyseries(self._s.take_with_series(s._s))
 
     @overload
     def __getitem__(self, item: int) -> Any:
@@ -917,47 +951,19 @@ class Series:
     @overload
     def __getitem__(
         self,
-        item: Series | range | slice | np.ndarray[Any, Any] | list[int] | list[bool],
+        item: Series | range | slice | np.ndarray[Any, Any] | list[int],
     ) -> Series:
         ...
 
     def __getitem__(
         self,
-        item: (
-            int | Series | range | slice | np.ndarray[Any, Any] | list[int] | list[bool]
-        ),
+        item: (int | Series | range | slice | np.ndarray[Any, Any] | list[int]),
     ) -> Any:
         if isinstance(item, Series) and item.dtype in INTEGER_DTYPES:
-            # Unsigned or signed Series (ordered from fastest to slowest).
-            #   - pl.UInt32 (polars) or pl.UInt64 (polars_u64_idx) Series indexes.
-            #   - Other unsigned Series indexes are converted to pl.UInt32 (polars)
-            #     or pl.UInt64 (polars_u64_idx).
-            #   - Signed Series indexes are converted pl.UInt32 (polars) or
-            #     pl.UInt64 (polars_u64_idx) after negative indexes are converted
-            #     to absolute indexes.
-            return self._from_pyseries(
-                self._s.take_with_series(self._pos_idxs(item)._s)
-            )
+            return self._take_with_series(item._pos_idxs(self.len()))
 
-        elif (
-            _check_for_numpy(item)
-            and isinstance(item, np.ndarray)
-            and item.dtype.kind in ("i", "u")
-        ):
-            if item.ndim != 1:
-                raise ValueError("Only a 1D-Numpy array is supported as index.")
-
-            # Unsigned or signed Numpy array (ordered from fastest to slowest).
-            #   - np.uint32 (polars) or np.uint64 (polars_u64_idx) numpy array
-            #     indexes.
-            #   - Other unsigned numpy array indexes are converted to pl.UInt32
-            #     (polars) or pl.UInt64 (polars_u64_idx).
-            #   - Signed numpy array indexes are converted pl.UInt32 (polars) or
-            #     pl.UInt64 (polars_u64_idx) after negative indexes are converted
-            #     to absolute indexes.
-            return self._from_pyseries(
-                self._s.take_with_series(self._pos_idxs(item)._s)
-            )
+        elif _check_for_numpy(item) and isinstance(item, np.ndarray):
+            return self._take_with_series(numpy_to_idxs(item, self.len()))
 
         # Integer.
         elif isinstance(item, int):
@@ -973,11 +979,16 @@ class Series:
         elif isinstance(item, range):
             return self[range_to_slice(item)]
 
-        # Sequence of integers (slow to check if sequence contains all integers).
-        elif is_int_sequence(item):
-            return self._from_pyseries(
-                self._s.take_with_series(self._pos_idxs(Series("", item))._s)
-            )
+        # Sequence of integers (also triggers on empty sequence)
+        elif isinstance(item, Sequence) and (
+            not item or (isinstance(item[0], int) and not isinstance(item[0], bool))  # type: ignore[redundant-expr]
+        ):
+            idx_series = Series("", item, dtype=Int64)._pos_idxs(self.len())
+            if idx_series.has_validity():
+                raise ValueError(
+                    "Cannot __getitem__ with index values containing nulls"
+                )
+            return self._take_with_series(idx_series)
 
         raise ValueError(
             f"Cannot __getitem__ on Series of dtype: '{self.dtype}' "
@@ -1026,6 +1037,12 @@ class Series:
             raise ValueError(f'cannot use "{key}" for indexing')
 
     def __array__(self, dtype: Any = None) -> np.ndarray[Any, Any]:
+        """
+        Numpy __array__ interface protocol.
+
+        Ensures that `np.asarray(pl.Series(..))` works as expected, see
+        https://numpy.org/devdocs/user/basics.interoperability.html#the-array-method.
+        """
         if not dtype and self.dtype == Utf8 and not self.has_validity():
             dtype = np.dtype("U")
         if dtype:
@@ -1404,7 +1421,7 @@ class Series:
         """Reduce this Series to the product value."""
         return self.to_frame().select(F.col(self.name).product()).to_series().item()
 
-    def pow(self, exponent: int | float | Series) -> Series:
+    def pow(self, exponent: int | float | None | Series) -> Series:
         """
         Raise to the power of the given exponent.
 
@@ -1594,10 +1611,12 @@ class Series:
         break_point_label: str = "break_point",
         category_label: str = "category",
         *,
-        maintain_order: bool = False,
-    ) -> DataFrame:
+        series: bool = True,
+        left_closed: bool = False,
+        include_breaks: bool = False,
+    ) -> DataFrame | Series:
         """
-        Bin values into discrete values.
+        Bin continuous values into discrete categories.
 
         Parameters
         ----------
@@ -1607,47 +1626,100 @@ class Series:
             Labels to assign to the bins. If given the length of labels must be
             len(bins) + 1.
         break_point_label
-            Name given to the breakpoint column.
+            Name given to the breakpoint column/field. Only used if series == False or
+            include_breaks == True
         category_label
-            Name given to the category column.
+            Name given to the category column. Only used if series == False
         maintain_order
-            Keep the order of the original `Series`.
+            Keep the order of the original `Series`. Only used if series == False
+        series
+            If True, return the a categorical series in the data's original order.
+        left_closed
+            Whether intervals should be [) instead of (]
+        include_breaks
+            Include the the right endpoint of the bin each observation falls in.
+            If returning a DataFrame, it will be a column, and if returning a Series
+            it will be a field in a Struct
 
         Returns
         -------
-        DataFrame
+        DataFrame or Series
 
         Examples
         --------
         >>> a = pl.Series("a", [v / 10 for v in range(-30, 30, 5)])
-        >>> a.cut([-1, 1])
+        >>> a.cut([-1, 1], series=False)
         shape: (12, 3)
-        ┌──────┬─────────────┬──────────────┐
-        │ a    ┆ break_point ┆ category     │
-        │ ---  ┆ ---         ┆ ---          │
-        │ f64  ┆ f64         ┆ cat          │
-        ╞══════╪═════════════╪══════════════╡
-        │ -3.0 ┆ -1.0        ┆ (-inf, -1.0] │
-        │ -2.5 ┆ -1.0        ┆ (-inf, -1.0] │
-        │ -2.0 ┆ -1.0        ┆ (-inf, -1.0] │
-        │ -1.5 ┆ -1.0        ┆ (-inf, -1.0] │
-        │ …    ┆ …           ┆ …            │
-        │ 1.0  ┆ 1.0         ┆ (-1.0, 1.0]  │
-        │ 1.5  ┆ inf         ┆ (1.0, inf]   │
-        │ 2.0  ┆ inf         ┆ (1.0, inf]   │
-        │ 2.5  ┆ inf         ┆ (1.0, inf]   │
-        └──────┴─────────────┴──────────────┘
-
+        ┌──────┬─────────────┬────────────┐
+        │ a    ┆ break_point ┆ category   │
+        │ ---  ┆ ---         ┆ ---        │
+        │ f64  ┆ f64         ┆ cat        │
+        ╞══════╪═════════════╪════════════╡
+        │ -3.0 ┆ -1.0        ┆ (-inf, -1] │
+        │ -2.5 ┆ -1.0        ┆ (-inf, -1] │
+        │ -2.0 ┆ -1.0        ┆ (-inf, -1] │
+        │ -1.5 ┆ -1.0        ┆ (-inf, -1] │
+        │ …    ┆ …           ┆ …          │
+        │ 1.0  ┆ 1.0         ┆ (-1, 1]    │
+        │ 1.5  ┆ inf         ┆ (1, inf]   │
+        │ 2.0  ┆ inf         ┆ (1, inf]   │
+        │ 2.5  ┆ inf         ┆ (1, inf]   │
+        └──────┴─────────────┴────────────┘
+        >>> a.cut([-1, 1], series=True)
+        shape: (12,)
+        Series: 'a' [cat]
+        [
+            "(-inf, -1]"
+            "(-inf, -1]"
+            "(-inf, -1]"
+            "(-inf, -1]"
+            "(-inf, -1]"
+            "(-1, 1]"
+            "(-1, 1]"
+            "(-1, 1]"
+            "(-1, 1]"
+            "(1, inf]"
+            "(1, inf]"
+            "(1, inf]"
+        ]
+        >>> a.cut([-1, 1], series=True, left_closed=True)
+        shape: (12,)
+        Series: 'a' [cat]
+        [
+            "[-inf, -1)"
+            "[-inf, -1)"
+            "[-inf, -1)"
+            "[-inf, -1)"
+            "[-1, 1)"
+            "[-1, 1)"
+            "[-1, 1)"
+            "[-1, 1)"
+            "[1, inf)"
+            "[1, inf)"
+            "[1, inf)"
+            "[1, inf)"
+        ]
         """
-        return wrap_df(
-            self._s.cut(
-                Series(break_point_label, bins, dtype=Float64)._s,
-                labels,
-                break_point_label,
-                category_label,
-                maintain_order,
+        n = self._s.name()
+
+        if not series:
+            # "Old style" always includes breaks
+            return (
+                self.to_frame()
+                .with_columns(
+                    F.col(n).cut(bins, labels, left_closed, True).alias(n + "_bin")
+                )
+                .unnest(n + "_bin")
+                .rename({"brk": break_point_label, n + "_bin": category_label})
             )
+        res = (
+            self.to_frame()
+            .select(F.col(n).cut(bins, labels, left_closed, include_breaks))
+            .to_series()
         )
+        if include_breaks:
+            return res.struct.rename_fields([break_point_label, category_label])
+        return res
 
     def qcut(
         self,
@@ -1656,29 +1728,45 @@ class Series:
         labels: list[str] | None = None,
         break_point_label: str = "break_point",
         category_label: str = "category",
-        maintain_order: bool = False,
-    ) -> DataFrame:
+        series: bool = False,
+        left_closed: bool = False,
+        allow_duplicates: bool = False,
+        include_breaks: bool = False,
+    ) -> DataFrame | Series:
         """
-        Bin values into discrete values based on their quantiles.
+        Bin continuous values into discrete categories based on their quantiles.
 
         Parameters
         ----------
         quantiles
-            Quaniles to create.
+            List of quantiles to create.
             We expect quantiles ``0.0 <= quantile <= 1``
         labels
             Labels to assign to the quantiles. If given the length of labels must be
             len(bins) + 1.
         break_point_label
-            Name given to the breakpoint column.
+            Name given to the breakpoint column/field. Only used if series == False or
+            include_breaks == True
         category_label
-            Name given to the category column.
+            Name given to the category column. Only used if series == False.
         maintain_order
-            Keep the order of the original `Series`.
+            Keep the order of the original `Series`. Only used if series == False.
+        series
+            If True, return a categorical series in the data's original order
+        left_closed
+            Whether intervals should be [) instead of (]
+        allow_duplicates
+            If True, the resulting quantile breaks don't have to be unique. This can
+            happen even with unique probs depending on the data. Duplicates will be
+            dropped, resulting in fewer bins.
+        include_breaks
+            Include the the right endpoint of the bin each observation falls in.
+            If returning a DataFrame, it will be a column, and if returning a Series
+            it will be a field in a Struct
 
         Returns
         -------
-        DataFrame
+        DataFrame or Series
 
         Warnings
         --------
@@ -1688,33 +1776,135 @@ class Series:
         Examples
         --------
         >>> a = pl.Series("a", range(-5, 3))
-        >>> a.qcut([0.0, 0.25, 0.75])
+        >>> a.qcut([0.0, 0.25, 0.75], series=False)
         shape: (8, 3)
-        ┌──────┬─────────────┬───────────────┐
-        │ a    ┆ break_point ┆ category      │
-        │ ---  ┆ ---         ┆ ---           │
-        │ f64  ┆ f64         ┆ cat           │
-        ╞══════╪═════════════╪═══════════════╡
-        │ -5.0 ┆ -5.0        ┆ (-inf, -5.0]  │
-        │ -4.0 ┆ -3.25       ┆ (-5.0, -3.25] │
-        │ -3.0 ┆ 0.25        ┆ (-3.25, 0.25] │
-        │ -2.0 ┆ 0.25        ┆ (-3.25, 0.25] │
-        │ -1.0 ┆ 0.25        ┆ (-3.25, 0.25] │
-        │ 0.0  ┆ 0.25        ┆ (-3.25, 0.25] │
-        │ 1.0  ┆ inf         ┆ (0.25, inf]   │
-        │ 2.0  ┆ inf         ┆ (0.25, inf]   │
-        └──────┴─────────────┴───────────────┘
-
+        ┌─────┬─────────────┬───────────────┐
+        │ a   ┆ break_point ┆ category      │
+        │ --- ┆ ---         ┆ ---           │
+        │ i64 ┆ f64         ┆ cat           │
+        ╞═════╪═════════════╪═══════════════╡
+        │ -5  ┆ -5.0        ┆ (-inf, -5]    │
+        │ -4  ┆ -3.25       ┆ (-5, -3.25]   │
+        │ -3  ┆ 0.25        ┆ (-3.25, 0.25] │
+        │ -2  ┆ 0.25        ┆ (-3.25, 0.25] │
+        │ -1  ┆ 0.25        ┆ (-3.25, 0.25] │
+        │ 0   ┆ 0.25        ┆ (-3.25, 0.25] │
+        │ 1   ┆ inf         ┆ (0.25, inf]   │
+        │ 2   ┆ inf         ┆ (0.25, inf]   │
+        └─────┴─────────────┴───────────────┘
+        >>> a.qcut([0.0, 0.25, 0.75], series=True)
+        shape: (8,)
+        Series: 'a' [cat]
+        [
+            "(-inf, -5]"
+            "(-5, -3.25]"
+            "(-3.25, 0.25]"
+            "(-3.25, 0.25]"
+            "(-3.25, 0.25]"
+            "(-3.25, 0.25]"
+            "(0.25, inf]"
+            "(0.25, inf]"
+        ]
+        >>> a.qcut([0.0, 0.25, 0.75], series=True, left_closed=True)
+        shape: (8,)
+        Series: 'a' [cat]
+        [
+            "[-5, -3.25)"
+            "[-5, -3.25)"
+            "[-3.25, 0.25)"
+            "[-3.25, 0.25)"
+            "[-3.25, 0.25)"
+            "[-3.25, 0.25)"
+            "[0.25, inf)"
+            "[0.25, inf)"
+        ]
         """
-        return wrap_df(
-            self._s.qcut(
-                Series(quantiles, dtype=Float64)._s,
-                labels,
-                break_point_label,
-                category_label,
-                maintain_order,
+        n = self._s.name()
+
+        if not series:
+            # "Old style" always includes breaks
+            return (
+                self.to_frame()
+                .with_columns(
+                    F.col(n)
+                    .qcut(quantiles, labels, left_closed, allow_duplicates, True)
+                    .alias(n + "_bin")
+                )
+                .unnest(n + "_bin")
+                .rename({"brk": break_point_label, n + "_bin": category_label})
             )
+        res = (
+            self.to_frame()
+            .select(
+                F.col(n).qcut(
+                    quantiles, labels, left_closed, allow_duplicates, include_breaks
+                )
+            )
+            .to_series()
         )
+        if include_breaks:
+            return res.struct.rename_fields([break_point_label, category_label])
+        return res
+
+    def rle(self) -> Series:
+        """
+        Get the lengths of runs of identical values.
+
+        Returns
+        -------
+            A Struct Series containing "lengths" and "values" Fields
+
+        Examples
+        --------
+        >>> s = pl.Series("s", [1, 1, 2, 1, None, 1, 3, 3])
+        >>> s.rle().struct.unnest()
+        shape: (6, 2)
+        ┌─────────┬────────┐
+        │ lengths ┆ values │
+        │ ---     ┆ ---    │
+        │ i32     ┆ i64    │
+        ╞═════════╪════════╡
+        │ 2       ┆ 1      │
+        │ 1       ┆ 2      │
+        │ 1       ┆ 1      │
+        │ 1       ┆ null   │
+        │ 1       ┆ 1      │
+        │ 2       ┆ 3      │
+        └─────────┴────────┘
+        """
+        return self.to_frame().select(F.col(self.name).rle()).to_series()
+
+    def rle_id(self) -> Series:
+        """
+        Map values to run IDs.
+
+        Similar to RLE, but it maps each value to an ID corresponding to the run into
+        which it falls. This is especially useful when you want to define groups by
+        runs of identical values rather than the values themselves.
+
+        Returns
+        -------
+            Series
+
+
+        Examples
+        --------
+        >>> s = pl.Series("s", [1, 1, 2, 1, None, 1, 3, 3])
+        >>> s.rle_id()
+        shape: (8,)
+        Series: 's' [u32]
+        [
+            0
+            0
+            1
+            2
+            3
+            4
+            5
+            5
+        ]
+        """
+        return self.to_frame().select(F.col(self.name).rle_id()).to_series()
 
     def hist(
         self,
@@ -1899,7 +2089,7 @@ class Series:
         s._s.rename(name)
         return s
 
-    def rename(self, name: str, *, in_place: bool = False) -> Series:
+    def rename(self, name: str, *, in_place: bool | None = None) -> Series:
         """
         Rename this Series.
 
@@ -1923,6 +2113,17 @@ class Series:
         ]
 
         """
+        if in_place is not None:
+            # if 'in_place' is not None, this indicates that the parameter was
+            # explicitly set by the caller, and we should warn against it (use
+            # of NoDefault only applies when one of the valid values is None).
+            warnings.warn(
+                "the `in_place` parameter is deprecated and will be removed in a future"
+                " version; note that renaming is a shallow-copy operation with"
+                " essentially zero cost.",
+                category=DeprecationWarning,
+                stacklevel=find_stacklevel(),
+            )
         if in_place:
             self._s.rename(name)
             return self
@@ -2157,12 +2358,12 @@ class Series:
                 self._s.append(other._s)
             else:
                 self._s.extend(other._s)
+            return self
         except RuntimeError as exc:
             if str(exc) == "Already mutably borrowed":
-                self.append(other.clone(), append_chunks=append_chunks)
+                return self.append(other.clone(), append_chunks=append_chunks)
             else:
                 raise exc
-        return self
 
     def filter(self, predicate: Series | list[bool]) -> Self:
         """
@@ -2886,7 +3087,7 @@ class Series:
 
     def explode(self) -> Series:
         """
-        Explode a list or utf8 Series.
+        Explode a list Series.
 
         This means that every item is expanded to a new row.
 
@@ -2896,8 +3097,8 @@ class Series:
 
         See Also
         --------
-        ListNameSpace.explode : Explode a list column.
-        StringNameSpace.explode : Explode a string column.
+        Series.list.explode : Explode a list column.
+        Series.str.explode : Explode a string column.
 
         """
 
@@ -3329,14 +3530,23 @@ class Series:
             if self.dtype == Date:
                 tp = "datetime64[D]"
             elif self.dtype == Duration:
-                tp = f"timedelta64[{self.time_unit}]"
+                tp = f"timedelta64[{self._s.time_unit()}]"
             else:
-                tp = f"datetime64[{self.time_unit}]"
+                tp = f"datetime64[{self._s.time_unit()}]"
             return arr.astype(tp)
 
         def raise_no_zero_copy() -> None:
             if zero_copy_only:
                 raise ValueError("Cannot return a zero-copy array")
+
+        if self.dtype == Array:
+            np_array = self.explode().to_numpy(
+                zero_copy_only=zero_copy_only,
+                writable=writable,
+                use_pyarrow=use_pyarrow,
+            )
+            np_array.shape = (self.len(), self.dtype.width)  # type: ignore[union-attr]
+            return np_array
 
         if (
             use_pyarrow
@@ -3347,6 +3557,7 @@ class Series:
             return self.to_arrow().to_numpy(
                 *args, zero_copy_only=zero_copy_only, writable=writable
             )
+
         elif self.dtype == Time:
             raise_no_zero_copy()
             # note: there is no native numpy "time" dtype
@@ -3396,7 +3607,7 @@ class Series:
 
     def to_pandas(  # noqa: D417
         self, *args: Any, use_pyarrow_extension_array: bool = False, **kwargs: Any
-    ) -> pd.Series:
+    ) -> pd.Series[Any]:
         """
         Convert this Series to a pandas Series.
 
@@ -4153,6 +4364,10 @@ class Series:
         """
         Apply a custom/user-defined function (UDF) over elements in this Series.
 
+        .. warning::
+            This method is much slower than the native expressions API.
+            Only use it if you cannot implement your logic otherwise.
+
         If the function returns a different datatype, the return_dtype arg should
         be set, otherwise the method will fail.
 
@@ -4179,6 +4394,11 @@ class Series:
             Nulls will be skipped and not passed to the python function.
             This is faster because python can be skipped and because we call
             more specialized functions.
+
+        Warnings
+        --------
+        If ``return_dtype`` is not provided, this may lead to unexpected results.
+        We allow this, but it is considered a bug in the user's query.
 
         Notes
         -----
@@ -4322,6 +4542,9 @@ class Series:
         this window will (optionally) be multiplied with the weights given by the
         `weight` vector. The resulting values will be aggregated to their sum.
 
+        The window at a given row will include the row itself and the `window_size - 1`
+        elements before it.
+
         Parameters
         ----------
         window_size
@@ -4374,6 +4597,9 @@ class Series:
         A window of length `window_size` will traverse the array. The values that fill
         this window will (optionally) be multiplied with the weights given by the
         `weight` vector. The resulting values will be aggregated to their sum.
+
+        The window at a given row will include the row itself and the `window_size - 1`
+        elements before it.
 
         Parameters
         ----------
@@ -4428,6 +4654,9 @@ class Series:
         this window will (optionally) be multiplied with the weights given by the
         `weight` vector. The resulting values will be aggregated to their sum.
 
+        The window at a given row will include the row itself and the `window_size - 1`
+        elements before it.
+
         Parameters
         ----------
         window_size
@@ -4481,6 +4710,9 @@ class Series:
         this window will (optionally) be multiplied with the weights given by the
         `weight` vector. The resulting values will be aggregated to their sum.
 
+        The window at a given row will include the row itself and the `window_size - 1`
+        elements before it.
+
         Parameters
         ----------
         window_size
@@ -4526,6 +4758,7 @@ class Series:
         min_periods: int | None = None,
         *,
         center: bool = False,
+        ddof: int = 1,
     ) -> Series:
         """
         Compute a rolling std dev.
@@ -4533,6 +4766,9 @@ class Series:
         A window of length `window_size` will traverse the array. The values that fill
         this window will (optionally) be multiplied with the weights given by the
         `weight` vector. The resulting values will be aggregated to their sum.
+
+        The window at a given row will include the row itself and the `window_size - 1`
+        elements before it.
 
         Parameters
         ----------
@@ -4546,6 +4782,8 @@ class Series:
             a result. If None, it will be set equal to window size.
         center
             Set the labels at the center of the window
+        ddof
+            "Delta Degrees of Freedom": The divisor for a length N window is N - ddof
 
         Examples
         --------
@@ -4567,7 +4805,7 @@ class Series:
             self.to_frame()
             .select(
                 F.col(self.name).rolling_std(
-                    window_size, weights, min_periods, center=center
+                    window_size, weights, min_periods, center=center, ddof=ddof
                 )
             )
             .to_series()
@@ -4580,6 +4818,7 @@ class Series:
         min_periods: int | None = None,
         *,
         center: bool = False,
+        ddof: int = 1,
     ) -> Series:
         """
         Compute a rolling variance.
@@ -4587,6 +4826,9 @@ class Series:
         A window of length `window_size` will traverse the array. The values that fill
         this window will (optionally) be multiplied with the weights given by the
         `weight` vector. The resulting values will be aggregated to their sum.
+
+        The window at a given row will include the row itself and the `window_size - 1`
+        elements before it.
 
         Parameters
         ----------
@@ -4600,6 +4842,8 @@ class Series:
             a result. If None, it will be set equal to window size.
         center
             Set the labels at the center of the window
+        ddof
+            "Delta Degrees of Freedom": The divisor for a length N window is N - ddof
 
         Examples
         --------
@@ -4621,7 +4865,7 @@ class Series:
             self.to_frame()
             .select(
                 F.col(self.name).rolling_var(
-                    window_size, weights, min_periods, center=center
+                    window_size, weights, min_periods, center=center, ddof=ddof
                 )
             )
             .to_series()
@@ -4645,6 +4889,9 @@ class Series:
             * rolling_max
             * rolling_mean
             * rolling_sum
+
+        The window at a given row will include the row itself and the `window_size - 1`
+        elements before it.
 
         Parameters
         ----------
@@ -4702,6 +4949,9 @@ class Series:
         center
             Set the labels at the center of the window
 
+        The window at a given row will include the row itself and the `window_size - 1`
+        elements before it.
+
         Examples
         --------
         >>> s = pl.Series("a", [1.0, 2.0, 3.0, 4.0, 6.0, 8.0])
@@ -4743,6 +4993,9 @@ class Series:
     ) -> Series:
         """
         Compute a rolling quantile.
+
+        The window at a given row will include the row itself and the `window_size - 1`
+        elements before it.
 
         Parameters
         ----------
@@ -4810,6 +5063,9 @@ class Series:
         """
         Compute a rolling skew.
 
+        The window at a given row includes the row itself and the
+        `window_size - 1` elements before it.
+
         Parameters
         ----------
         window_size
@@ -4819,18 +5075,20 @@ class Series:
 
         Examples
         --------
-        >>> s = pl.Series("a", [1.0, 2.0, 3.0, 4.0, 6.0, 8.0])
-        >>> s.rolling_skew(window_size=3)
-        shape: (6,)
-        Series: 'a' [f64]
+        >>> pl.Series([1, 4, 2, 9]).rolling_skew(3)
+        shape: (4,)
+        Series: '' [f64]
         [
-                null
-                null
-                0.0
-                0.0
-                0.381802
-                0.0
+            null
+            null
+            0.381802
+            0.47033
         ]
+
+        Note how the values match
+
+        >>> pl.Series([1, 4, 2]).skew(), pl.Series([4, 2, 9]).skew()
+        (0.38180177416060584, 0.47033046033698594)
 
         """
 
@@ -5429,7 +5687,7 @@ class Series:
 
         Remap, setting a default for unrecognised values...
 
-        >>> s.map_dict(country_lookup, default="Unspecified").rename("country_name")
+        >>> s.map_dict(country_lookup, default="Unspecified").alias("country_name")
         shape: (4,)
         Series: 'country_name' [str]
         [
@@ -5441,7 +5699,7 @@ class Series:
 
         ...or keep the original value, by making use of ``pl.first()``:
 
-        >>> s.map_dict(country_lookup, default=pl.first()).rename("country_name")
+        >>> s.map_dict(country_lookup, default=pl.first()).alias("country_name")
         shape: (4,)
         Series: 'country_name' [str]
         [
@@ -5453,7 +5711,7 @@ class Series:
 
         ...or keep the original value, by assigning the input series:
 
-        >>> s.map_dict(country_lookup, default=s).rename("country_name")
+        >>> s.map_dict(country_lookup, default=s).alias("country_name")
         shape: (4,)
         Series: 'country_name' [str]
         [
@@ -5496,7 +5754,7 @@ class Series:
 
         See Also
         --------
-        ListNameSpace.explode : Explode a list column.
+        Series.list.explode : Explode a list column.
 
         Examples
         --------
@@ -5535,6 +5793,15 @@ class Series:
         ]
 
         """
+        return (
+            self.to_frame()
+            .select(
+                F.col(self.name).shuffle(
+                    seed=seed,
+                )
+            )
+            .to_series()
+        )
 
     def ewm_mean(
         self,
@@ -5847,13 +6114,8 @@ class Series:
     def implode(self) -> Self:
         """Aggregate values into a list."""
 
-    # Below are the namespaces defined. Do not move these up in the definition of
-    # Series, as it confuses mypy between the type annotation `str` and the
-    # namespace `str`
-    @property
-    def arr(self) -> ListNameSpace:
-        """Create an object namespace of all list related methods."""
-        return ListNameSpace(self)
+    # Keep the `list` and `str` properties below at the end of the definition of Series,
+    # as to not confuse mypy with the type annotation `str` and `list`
 
     @property
     def bin(self) -> BinaryNameSpace:
@@ -5869,6 +6131,16 @@ class Series:
     def dt(self) -> DateTimeNameSpace:
         """Create an object namespace of all datetime related methods."""
         return DateTimeNameSpace(self)
+
+    @property
+    def list(self) -> ListNameSpace:
+        """Create an object namespace of all list related methods."""
+        return ListNameSpace(self)
+
+    @property
+    def arr(self) -> ArrayNameSpace:
+        """Create an object namespace of all array related methods."""
+        return ArrayNameSpace(self)
 
     @property
     def str(self) -> StringNameSpace:
@@ -5895,4 +6167,6 @@ def _resolve_datetime_dtype(
             dtype = Datetime("us")
         elif time_unit == "ms":
             dtype = Datetime("ms")
+        elif time_unit == "D":
+            dtype = Date
     return dtype

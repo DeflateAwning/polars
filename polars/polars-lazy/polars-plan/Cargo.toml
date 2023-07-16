@@ -13,28 +13,30 @@ ahash.workspace = true
 arrow.workspace = true
 chrono = { version = "0.4", optional = true }
 chrono-tz = { version = "0.8", optional = true }
+ciborium = { version = "0.2", optional = true }
 futures = { version = "0.3.25", optional = true }
 once_cell.workspace = true
-polars-arrow = { version = "0.28.0", path = "../../polars-arrow" }
-polars-core = { version = "0.28.0", path = "../../polars-core", features = ["lazy", "private", "zip_with", "random"], default-features = false }
-polars-io = { version = "0.28.0", path = "../../polars-io", features = ["lazy", "csv", "private"], default-features = false }
-polars-ops = { version = "0.28.0", path = "../../polars-ops", default-features = false }
-polars-time = { version = "0.28.0", path = "../../polars-time", optional = true }
-polars-utils = { version = "0.28.0", path = "../../polars-utils" }
-pyo3 = { version = "0.18", optional = true }
+polars-arrow = { version = "0.31.1", path = "../../polars-arrow" }
+polars-core = { version = "0.31.1", path = "../../polars-core", features = ["lazy", "zip_with", "random"], default-features = false }
+polars-io = { version = "0.31.1", path = "../../polars-io", features = ["lazy", "csv"], default-features = false }
+polars-ops = { version = "0.31.1", path = "../../polars-ops", default-features = false }
+polars-time = { version = "0.31.1", path = "../../polars-time", optional = true }
+polars-utils = { version = "0.31.1", path = "../../polars-utils" }
+pyo3 = { version = "0.19", optional = true }
 rayon.workspace = true
 regex = { version = "1.6", optional = true }
 serde = { version = "1", features = ["derive", "rc"], optional = true }
 smartstring.workspace = true
+strum_macros.workspace = true
 
 [features]
 # debugging utility
 debugging = []
-python = ["pyo3"]
+python = ["pyo3", "ciborium"]
 # make sure we don't compile unneeded things even though
 # this dependency gets activated
 compile = []
-default = ["compile", "private"]
+default = ["compile"]
 streaming = []
 parquet = ["polars-core/parquet", "polars-io/parquet"]
 async = []
@@ -55,6 +57,7 @@ dtype-date = ["polars-core/dtype-date", "polars-time/dtype-date", "temporal"]
 dtype-datetime = ["polars-core/dtype-datetime", "polars-time/dtype-datetime", "temporal"]
 dtype-duration = ["polars-core/dtype-duration", "polars-time/dtype-duration", "temporal"]
 dtype-time = ["polars-core/dtype-time", "polars-time/dtype-time"]
+dtype-array = ["polars-core/dtype-array"]
 dtype-categorical = ["polars-core/dtype-categorical"]
 dtype-struct = ["polars-core/dtype-struct"]
 object = ["polars-core/object"]
@@ -66,6 +69,8 @@ sign = []
 timezones = ["chrono-tz", "polars-time/timezones", "polars-core/timezones", "regex"]
 binary_encoding = ["polars-ops/binary_encoding"]
 true_div = []
+nightly = ["polars-utils/nightly", "polars-ops/nightly"]
+extract_jsonpath = []
 
 # operations
 approx_unique = ["polars-ops/approx_unique"]
@@ -77,7 +82,7 @@ is_unique = ["polars-ops/is_unique"]
 cross_join = ["polars-core/cross_join"]
 asof_join = ["polars-core/asof_join", "polars-time", "polars-ops/asof_join"]
 concat_str = ["polars-core/concat_str"]
-arange = []
+range = []
 mode = ["polars-core/mode"]
 cum_agg = ["polars-core/cum_agg"]
 interpolate = ["polars-ops/interpolate"]
@@ -100,7 +105,6 @@ unique_counts = ["polars-core/unique_counts"]
 log = ["polars-ops/log"]
 chunked_ids = ["polars-core/chunked_ids"]
 list_to_struct = ["polars-ops/list_to_struct"]
-# python = ["pyo3"]
 row_hash = ["polars-core/row_hash", "polars-ops/hash"]
 string_justify = ["polars-ops/string_justify"]
 string_from_radix = ["polars-ops/string_from_radix"]
@@ -115,9 +119,10 @@ cse = []
 propagate_nans = ["polars-ops/propagate_nans"]
 coalesce = []
 fused = []
-
-# no guarantees whatsoever
-private = ["polars-time/private"]
+list_sets = ["polars-ops/list_sets"]
+list_any_all = ["polars-ops/list_any_all"]
+cutqcut = ["polars-ops/cutqcut"]
+rle = ["polars-ops/rle"]
 
 bigidx = ["polars-arrow/bigidx", "polars-core/bigidx", "polars-utils/bigidx"]
 

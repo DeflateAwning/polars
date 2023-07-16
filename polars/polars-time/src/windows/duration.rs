@@ -6,7 +6,7 @@ use polars_arrow::error::polars_err;
 use polars_arrow::export::arrow::temporal_conversions::{
     timestamp_ms_to_datetime, timestamp_ns_to_datetime, timestamp_us_to_datetime, MILLISECONDS,
 };
-use polars_arrow::time_zone::PolarsTimeZone;
+use polars_arrow::time_zone::Tz;
 use polars_core::export::arrow::temporal_conversions::MICROSECONDS;
 use polars_core::prelude::{
     datetime_to_timestamp_ms, datetime_to_timestamp_ns, datetime_to_timestamp_us, polars_bail,
@@ -92,12 +92,18 @@ impl Duration {
     /// * `d`:  day
     /// * `w`:  week
     /// * `mo`: calendar month
+    /// * `q`: calendar quarter
     /// * `y`:  calendar year
     /// * `i`:  index value (only for {Int32, Int64} dtypes)
     ///
     /// Suffix with `"_saturating"` to indicate that dates too large for
     /// their month should saturate at the largest date (e.g. 2022-02-29 -> 2022-02-28)
     /// instead of erroring.
+    ///
+    /// By "calendar day", we mean the corresponding time on the next
+    /// day (which may not be 24 hours, depending on daylight savings).
+    /// Similarly for "calendar week", "calendar month", "calendar quarter",
+    /// and "calendar year".
     ///
     /// # Panics
     /// If the given str is invalid for any reason.
@@ -171,13 +177,14 @@ impl Duration {
                     "mo" => {
                         months += n
                     }
+                    "q" => months += n * 3,
                     "y" => months += n * 12,
                     // we will read indexes as nanoseconds
                     "i" => {
                         nsecs += n;
                         parsed_int = true;
                     }
-                    unit => panic!("unit: '{unit}' not supported. Available units are: 'ns', 'us', 'ms', 's', 'm', 'h', 'd', 'w', 'mo', 'y', 'i'"),
+                    unit => panic!("unit: '{unit}' not supported. Available units are: 'ns', 'us', 'ms', 's', 'm', 'h', 'd', 'w', 'q', 'mo', 'y', 'i'"),
                 }
                 unit.clear();
             }
@@ -331,13 +338,16 @@ impl Duration {
         self.days
     }
 
+    pub fn is_constant_duration(&self) -> bool {
+        self.months == 0 && self.weeks == 0 && self.days == 0
+    }
+
     /// Returns the nanoseconds from the `Duration` without the weeks or months part.
     pub fn nanoseconds(&self) -> i64 {
         self.nsecs
     }
 
     /// Estimated duration of the window duration. Not a very good one if months != 0.
-    #[cfg(feature = "private")]
     #[doc(hidden)]
     pub const fn duration_ns(&self) -> i64 {
         self.months * 28 * 24 * 3600 * NANOSECONDS
@@ -346,25 +356,85 @@ impl Duration {
             + self.nsecs
     }
 
-    #[cfg(feature = "private")]
     #[doc(hidden)]
     pub const fn duration_us(&self) -> i64 {
         self.months * 28 * 24 * 3600 * MICROSECONDS
             + (self.weeks * NS_WEEK + self.nsecs + self.days * NS_DAY) / 1000
     }
 
-    #[cfg(feature = "private")]
     #[doc(hidden)]
     pub const fn duration_ms(&self) -> i64 {
         self.months * 28 * 24 * 3600 * MILLISECONDS
             + (self.weeks * NS_WEEK + self.nsecs + self.days * NS_DAY) / 1_000_000
     }
 
+    #[doc(hidden)]
+    fn add_month(
+        ts: NaiveDateTime,
+        n_months: i64,
+        negative: bool,
+        saturating: bool,
+    ) -> PolarsResult<NaiveDateTime> {
+        let mut months = n_months;
+        if negative {
+            months = -months;
+        }
+
+        // Retrieve the current date and increment the values
+        // based on the number of months
+        let mut year = ts.year();
+        let mut month = ts.month() as i32;
+        let mut day = ts.day();
+        year += (months / 12) as i32;
+        month += (months % 12) as i32;
+
+        // if the month overflowed or underflowed, adjust the year
+        // accordingly. Because we add the modulo for the months
+        // the year will only adjust by one
+        if month > 12 {
+            year += 1;
+            month -= 12;
+        } else if month <= 0 {
+            year -= 1;
+            month += 12;
+        }
+
+        if saturating {
+            // Normalize the day if we are past the end of the month.
+            let mut last_day_of_month = last_day_of_month(month);
+            if month == (chrono::Month::February.number_from_month() as i32) && is_leap_year(year) {
+                last_day_of_month += 1;
+            }
+
+            if day > last_day_of_month {
+                day = last_day_of_month
+            }
+        }
+
+        // Retrieve the original time and construct a data
+        // with the new year, month and day
+        let hour = ts.hour();
+        let minute = ts.minute();
+        let sec = ts.second();
+        let nsec = ts.nanosecond();
+        new_datetime(year, month as u32, day, hour, minute, sec, nsec).ok_or(
+            polars_err!(
+                ComputeError: format!(
+                    "cannot advance '{}' by {} month(s). \
+                        If you were trying to get the last day of each month, you may want to try `.dt.month_end` \
+                        or append \"_saturating\" to your duration string.",
+                        ts,
+                        if negative {-n_months} else {n_months}
+                )
+            ),
+        )
+    }
+
     #[inline]
     pub fn truncate_impl<F, G, J>(
         &self,
         t: i64,
-        tz: Option<&impl PolarsTimeZone>,
+        tz: Option<&Tz>,
         nsecs_to_unit: F,
         timestamp_to_datetime: G,
         datetime_to_timestamp: J,
@@ -478,7 +548,7 @@ impl Duration {
 
     // Truncate the given ns timestamp by the window boundary.
     #[inline]
-    pub fn truncate_ns(&self, t: i64, tz: Option<&impl PolarsTimeZone>) -> PolarsResult<i64> {
+    pub fn truncate_ns(&self, t: i64, tz: Option<&Tz>) -> PolarsResult<i64> {
         self.truncate_impl(
             t,
             tz,
@@ -490,7 +560,7 @@ impl Duration {
 
     // Truncate the given ns timestamp by the window boundary.
     #[inline]
-    pub fn truncate_us(&self, t: i64, tz: Option<&impl PolarsTimeZone>) -> PolarsResult<i64> {
+    pub fn truncate_us(&self, t: i64, tz: Option<&Tz>) -> PolarsResult<i64> {
         self.truncate_impl(
             t,
             tz,
@@ -502,7 +572,7 @@ impl Duration {
 
     // Truncate the given ms timestamp by the window boundary.
     #[inline]
-    pub fn truncate_ms(&self, t: i64, tz: Option<&impl PolarsTimeZone>) -> PolarsResult<i64> {
+    pub fn truncate_ms(&self, t: i64, tz: Option<&Tz>) -> PolarsResult<i64> {
         self.truncate_impl(
             t,
             tz,
@@ -515,7 +585,7 @@ impl Duration {
     fn add_impl_month_week_or_day<F, G, J>(
         &self,
         t: i64,
-        tz: Option<&impl PolarsTimeZone>,
+        tz: Option<&Tz>,
         nsecs_to_unit: F,
         timestamp_to_datetime: G,
         datetime_to_timestamp: J,
@@ -529,62 +599,12 @@ impl Duration {
         let mut new_t = t;
 
         if d.months > 0 {
-            let mut months = d.months;
-            if d.negative {
-                months = -months;
-            }
-
-            // Retrieve the current date and increment the values
-            // based on the number of months
             let ts = match tz {
                 #[cfg(feature = "timezones")]
                 Some(tz) => unlocalize_datetime(timestamp_to_datetime(t), tz),
                 _ => timestamp_to_datetime(t),
             };
-            let mut year = ts.year();
-            let mut month = ts.month() as i32;
-            let mut day = ts.day();
-            year += (months / 12) as i32;
-            month += (months % 12) as i32;
-
-            // if the month overflowed or underflowed, adjust the year
-            // accordingly. Because we add the modulo for the months
-            // the year will only adjust by one
-            if month > 12 {
-                year += 1;
-                month -= 12;
-            } else if month <= 0 {
-                year -= 1;
-                month += 12;
-            }
-
-            if d.saturating {
-                // Normalize the day if we are past the end of the month.
-                let mut last_day_of_month = last_day_of_month(month);
-                if month == (chrono::Month::February.number_from_month() as i32)
-                    && is_leap_year(year)
-                {
-                    last_day_of_month += 1;
-                }
-
-                if day > last_day_of_month {
-                    day = last_day_of_month
-                }
-            }
-
-            // Retrieve the original time and construct a data
-            // with the new year, month and day
-            let hour = ts.hour();
-            let minute = ts.minute();
-            let sec = ts.second();
-            let nsec = ts.nanosecond();
-            let dt = new_datetime(year, month as u32, day, hour, minute, sec, nsec).ok_or(
-                polars_err!(
-                    ComputeError: format!(
-                        "cannot advance '{}' by {} month(s). \
-                         If you were trying to get the last day of each month, you may want to try `.dt.month_end`", ts, if d.negative {-d.months} else {d.months})
-                ),
-            )?;
+            let dt = Self::add_month(ts, d.months, d.negative, d.saturating)?;
             new_t = match tz {
                 #[cfg(feature = "timezones")]
                 Some(tz) => datetime_to_timestamp(localize_datetime(dt, tz)?),
@@ -625,7 +645,7 @@ impl Duration {
         Ok(new_t)
     }
 
-    pub fn add_ns(&self, t: i64, tz: Option<&impl PolarsTimeZone>) -> PolarsResult<i64> {
+    pub fn add_ns(&self, t: i64, tz: Option<&Tz>) -> PolarsResult<i64> {
         let d = self;
         let new_t = self.add_impl_month_week_or_day(
             t,
@@ -638,7 +658,7 @@ impl Duration {
         Ok(new_t? + nsecs)
     }
 
-    pub fn add_us(&self, t: i64, tz: Option<&impl PolarsTimeZone>) -> PolarsResult<i64> {
+    pub fn add_us(&self, t: i64, tz: Option<&Tz>) -> PolarsResult<i64> {
         let d = self;
         let new_t = self.add_impl_month_week_or_day(
             t,
@@ -651,7 +671,7 @@ impl Duration {
         Ok(new_t? + nsecs / 1_000)
     }
 
-    pub fn add_ms(&self, t: i64, tz: Option<&impl PolarsTimeZone>) -> PolarsResult<i64> {
+    pub fn add_ms(&self, t: i64, tz: Option<&Tz>) -> PolarsResult<i64> {
         let d = self;
         let new_t = self.add_impl_month_week_or_day(
             t,
@@ -718,7 +738,6 @@ mod test {
 
     #[test]
     fn test_add_ns() {
-        use polars_arrow::time_zone::NO_TIMEZONE;
         let t = 1;
         let seven_days = Duration::parse("7d");
         let one_week = Duration::parse("1w");
@@ -726,8 +745,8 @@ mod test {
         // add_ns can only error if a time zone is passed, so it's
         // safe to unwrap here
         assert_eq!(
-            seven_days.add_ns(t, NO_TIMEZONE).unwrap(),
-            one_week.add_ns(t, NO_TIMEZONE).unwrap()
+            seven_days.add_ns(t, None).unwrap(),
+            one_week.add_ns(t, None).unwrap()
         );
 
         let seven_days_negative = Duration::parse("-7d");
@@ -736,8 +755,8 @@ mod test {
         // add_ns can only error if a time zone is passed, so it's
         // safe to unwrap here
         assert_eq!(
-            seven_days_negative.add_ns(t, NO_TIMEZONE).unwrap(),
-            one_week_negative.add_ns(t, NO_TIMEZONE).unwrap()
+            seven_days_negative.add_ns(t, None).unwrap(),
+            one_week_negative.add_ns(t, None).unwrap()
         );
     }
 }

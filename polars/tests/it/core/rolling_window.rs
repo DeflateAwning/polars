@@ -1,3 +1,7 @@
+use std::any::Any;
+
+use polars_core::prelude::QuantileInterpolOptions::Linear;
+
 use super::*;
 
 #[test]
@@ -267,18 +271,25 @@ fn test_rolling_var() {
             ..Default::default()
         })
         .unwrap();
-    let out = out.f64().unwrap();
+    let out = out.f64().unwrap().to_vec();
 
-    assert_eq!(
-        Vec::from(out),
-        &[
-            None,
-            Some(17.333333333333332),
-            Some(11.583333333333334),
-            Some(21.583333333333332),
-            Some(24.666666666666668),
-            Some(34.33333333333334)
-        ]
+    let exp_res = &[
+        None,
+        Some(17.333333333333332),
+        Some(11.583333333333334),
+        Some(21.583333333333332),
+        Some(24.666666666666668),
+        Some(34.33333333333334),
+    ];
+    let test_res = out.iter().zip(exp_res.iter()).all(|(&a, &b)| match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => (a - b).abs() < 1e-12,
+        (_, _) => false,
+    });
+    assert!(
+        test_res,
+        "{:?} is not approximately equal to {:?}",
+        out, exp_res
     );
 }
 
@@ -302,29 +313,27 @@ fn test_median_quantile_types() {
         })
         .unwrap();
 
+    let rq_params = Some(Arc::new(RollingQuantileParams {
+        prob: 0.3,
+        interpol: Linear,
+    }) as Arc<dyn Any + Send + Sync>);
     let rol_quantile = s
-        .rolling_quantile(
-            0.3,
-            QuantileInterpolOptions::Linear,
-            RollingOptionsImpl {
-                window_size: Duration::new(2),
-                min_periods: 1,
-                ..Default::default()
-            },
-        )
+        .rolling_quantile(RollingOptionsImpl {
+            window_size: Duration::new(2),
+            min_periods: 1,
+            fn_params: rq_params.clone(),
+            ..Default::default()
+        })
         .unwrap();
 
     let rol_quantile_weighted = s
-        .rolling_quantile(
-            0.3,
-            QuantileInterpolOptions::Linear,
-            RollingOptionsImpl {
-                window_size: Duration::new(2),
-                min_periods: 1,
-                weights: Some(vec![1.0, 2.0]),
-                ..Default::default()
-            },
-        )
+        .rolling_quantile(RollingOptionsImpl {
+            window_size: Duration::new(2),
+            min_periods: 1,
+            weights: Some(vec![1.0, 2.0]),
+            fn_params: rq_params.clone(),
+            ..Default::default()
+        })
         .unwrap();
 
     assert_eq!(*rol_med.dtype(), DataType::Float64);
@@ -351,28 +360,22 @@ fn test_median_quantile_types() {
         .unwrap();
 
     let rol_quantile = s
-        .rolling_quantile(
-            0.3,
-            QuantileInterpolOptions::Linear,
-            RollingOptionsImpl {
-                window_size: Duration::new(2),
-                min_periods: 1,
-                ..Default::default()
-            },
-        )
+        .rolling_quantile(RollingOptionsImpl {
+            window_size: Duration::new(2),
+            min_periods: 1,
+            fn_params: rq_params.clone(),
+            ..Default::default()
+        })
         .unwrap();
 
     let rol_quantile_weighted = s
-        .rolling_quantile(
-            0.3,
-            QuantileInterpolOptions::Linear,
-            RollingOptionsImpl {
-                window_size: Duration::new(2),
-                min_periods: 1,
-                weights: Some(vec![1.0, 2.0]),
-                ..Default::default()
-            },
-        )
+        .rolling_quantile(RollingOptionsImpl {
+            window_size: Duration::new(2),
+            min_periods: 1,
+            weights: Some(vec![1.0, 2.0]),
+            fn_params: rq_params.clone(),
+            ..Default::default()
+        })
         .unwrap();
 
     assert_eq!(*rol_med.dtype(), DataType::Float32);
@@ -399,28 +402,22 @@ fn test_median_quantile_types() {
         .unwrap();
 
     let rol_quantile = s1
-        .rolling_quantile(
-            0.3,
-            QuantileInterpolOptions::Linear,
-            RollingOptionsImpl {
-                window_size: Duration::new(2),
-                min_periods: 1,
-                ..Default::default()
-            },
-        )
+        .rolling_quantile(RollingOptionsImpl {
+            window_size: Duration::new(2),
+            min_periods: 1,
+            fn_params: rq_params.clone(),
+            ..Default::default()
+        })
         .unwrap();
 
     let rol_quantile_weighted = s1
-        .rolling_quantile(
-            0.3,
-            QuantileInterpolOptions::Linear,
-            RollingOptionsImpl {
-                window_size: Duration::new(2),
-                min_periods: 1,
-                weights: Some(vec![1.0, 2.0]),
-                ..Default::default()
-            },
-        )
+        .rolling_quantile(RollingOptionsImpl {
+            window_size: Duration::new(2),
+            min_periods: 1,
+            weights: Some(vec![1.0, 2.0]),
+            fn_params: rq_params.clone(),
+            ..Default::default()
+        })
         .unwrap();
 
     assert_eq!(*rol_med.dtype(), DataType::Float64);

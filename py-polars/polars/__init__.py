@@ -4,9 +4,13 @@ import os
 with contextlib.suppress(ImportError):  # Module not available when building docs
     # ensure the object constructor is known by polars
     # we set this once on import
-    from polars.polars import register_object_builder
 
-    register_object_builder()
+    # we also set other function pointers needed
+    # on the rust side. This function is highly
+    # unsafe and should only be called once.
+    from polars.polars import __register_startup_deps
+
+    __register_startup_deps()
 
 from polars import api
 from polars.config import Config
@@ -28,6 +32,7 @@ from polars.datatypes import (
     INTEGER_DTYPES,
     NUMERIC_DTYPES,
     TEMPORAL_DTYPES,
+    Array,
     Binary,
     Boolean,
     Categorical,
@@ -70,18 +75,12 @@ from polars.exceptions import (
     StructFieldNotFoundError,
 )
 from polars.expr import Expr
-from polars.functions.eager import (
+from polars.functions import (
     align_frames,
-    concat,
-    cut,
-    date_range,
-    get_dummies,
-    ones,
-    zeros,
-)
-from polars.functions.lazy import (
     all,
+    all_horizontal,
     any,
+    any_horizontal,
     apply,
     approx_unique,
     arange,
@@ -91,6 +90,7 @@ from polars.functions.lazy import (
     coalesce,
     col,
     collect_all,
+    concat,
     concat_list,
     concat_str,
     corr,
@@ -99,6 +99,10 @@ from polars.functions.lazy import (
     cumfold,
     cumreduce,
     cumsum,
+    cumsum_horizontal,
+    date,
+    date_range,
+    datetime,
     duration,
     element,
     exclude,
@@ -109,32 +113,37 @@ from polars.functions.lazy import (
     groups,
     head,
     implode,
+    int_range,
+    int_ranges,
     last,
     lit,
     map,
     max,
+    max_horizontal,
     mean,
     median,
     min,
+    min_horizontal,
     n_unique,
-    pearson_corr,
+    ones,
     quantile,
     reduce,
     repeat,
     rolling_corr,
     rolling_cov,
     select,
-    spearman_rank_corr,
+    sql_expr,
     std,
     struct,
     sum,
+    sum_horizontal,
     tail,
+    time,
+    time_range,
     var,
+    when,
+    zeros,
 )
-from polars.functions.lazy import date_ as date
-from polars.functions.lazy import datetime_ as datetime
-from polars.functions.lazy import list_ as list
-from polars.functions.whenthen import when
 from polars.io import (
     read_avro,
     read_csv,
@@ -148,7 +157,6 @@ from polars.io import (
     read_ndjson,
     read_parquet,
     read_parquet_schema,
-    read_sql,
     scan_csv,
     scan_delta,
     scan_ds,
@@ -204,6 +212,7 @@ __all__ = [
     "LazyFrame",
     "Series",
     # polars.datatypes
+    "Array",
     "Binary",
     "Boolean",
     "Categorical",
@@ -252,7 +261,6 @@ __all__ = [
     "read_ndjson",
     "read_parquet",
     "read_parquet_schema",
-    "read_sql",
     "scan_csv",
     "scan_delta",
     "scan_ds",
@@ -273,16 +281,26 @@ __all__ = [
     "align_frames",
     "arg_where",
     "concat",
-    "cut",
     "date_range",
     "element",
-    "get_dummies",
     "ones",
     "repeat",
+    "time_range",
     "zeros",
-    # polars.functions.lazy
+    # polars.functions.aggregation
     "all",
     "any",
+    "cumsum",
+    "max",
+    "min",
+    "sum",
+    "all_horizontal",
+    "any_horizontal",
+    "cumsum_horizontal",
+    "max_horizontal",
+    "min_horizontal",
+    "sum_horizontal",
+    # polars.functions.lazy
     "apply",
     "arange",
     "arg_sort_by",
@@ -297,7 +315,6 @@ __all__ = [
     "cov",
     "cumfold",
     "cumreduce",
-    "cumsum",
     "date",  # named date_, see import above
     "datetime",  # named datetime_, see import above
     "duration",
@@ -309,27 +326,24 @@ __all__ = [
     "groups",
     "head",
     "implode",
+    "int_range",
+    "int_ranges",
     "last",
-    "list",  # named list_, see import above
     "lit",
     "map",
-    "max",
     "mean",
     "median",
-    "min",
     "n_unique",
     "approx_unique",
-    "pearson_corr",
     "quantile",
     "reduce",
     "rolling_corr",
     "rolling_cov",
     "select",
-    "spearman_rank_corr",
     "std",
     "struct",
-    "sum",
     "tail",
+    "time",  # named time_, see import above
     "var",
     # polars.convert
     "from_arrow",
@@ -348,6 +362,9 @@ __all__ = [
     "get_index_type",
     "show_versions",
     "threadpool_size",
+    # selectors
+    "selectors",
+    "sql_expr",
 ]
 
 os.environ["POLARS_ALLOW_EXTENSION"] = "true"

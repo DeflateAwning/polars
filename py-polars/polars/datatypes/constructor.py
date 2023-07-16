@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 from decimal import Decimal as PyDecimal
 from typing import TYPE_CHECKING, Any, Callable, Sequence
 
@@ -50,8 +51,13 @@ def polars_type_to_constructor(
 ) -> Callable[[str, Sequence[Any], bool], PySeries]:
     """Get the right PySeries constructor for the given Polars dtype."""
     try:
-        dtype = dtype.base_type()
-        return _POLARS_TYPE_TO_CONSTRUCTOR[dtype]
+        base_type = dtype.base_type()
+        # special case for Array as it needs to pass the width argument
+        # upon construction
+        if base_type == dt.Array:
+            return functools.partial(PySeries.new_array, dtype.width, dtype.inner)  # type: ignore[union-attr]
+
+        return _POLARS_TYPE_TO_CONSTRUCTOR[base_type]
     except KeyError:  # pragma: no cover
         raise ValueError(f"Cannot construct PySeries for type {dtype}.") from None
 
@@ -96,10 +102,14 @@ def numpy_values_and_dtype(
         values = values.astype(np.float32)
         dtype = values.dtype.type
     elif dtype == np.datetime64:
-        if np.datetime_data(values.dtype)[0] in dt.DTYPE_TEMPORAL_UNITS:
+        time_unit = np.datetime_data(values.dtype)[0]
+        if time_unit in dt.DTYPE_TEMPORAL_UNITS or time_unit == "D":
             values = values.astype(np.int64)
         else:
-            dtype = object
+            raise ValueError(
+                "Only 'D', 'ms', 'us', and 'ns' resolutions are supported when converting from numpy.datetime64. "
+                "Please cast to the closest supported unit before converting."
+            )
     return values, dtype
 
 

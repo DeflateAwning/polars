@@ -240,84 +240,48 @@ impl PredicatePushDown {
                     schema: Arc::new(schema),
                 })
             }
-            #[cfg(feature = "ipc")]
-            IpcScan {
+            Scan {
                 path,
                 file_info,
-                output_schema,
                 predicate,
-                options,
+                scan_type,
+                file_options: options,
+                output_schema
             } => {
                 let local_predicates = partition_by_full_context(&mut acc_predicates, expr_arena);
                 let predicate = predicate_at_scan(acc_predicates, predicate, expr_arena);
 
-                let lp = IpcScan {
-                    path,
-                    file_info,
-                    output_schema,
-                    predicate,
-                    options,
-                };
-                Ok(self.optional_apply_predicate(lp, local_predicates, lp_arena, expr_arena))
-            }
-            #[cfg(feature = "parquet")]
-            ParquetScan {
-                path,
-                file_info,
-                output_schema,
-                predicate,
-                options,
-                cloud_options,
-            } => {
-                let local_predicates = partition_by_full_context(&mut acc_predicates, expr_arena);
-
-                let predicate = predicate_at_scan(acc_predicates, predicate, expr_arena);
-
-                let lp = ParquetScan {
-                    path,
-                    file_info,
-                    output_schema,
-                    predicate,
-                    options,
-                    cloud_options,
-                };
-                Ok(self.optional_apply_predicate(lp, local_predicates, lp_arena, expr_arena))
-            }
-            #[cfg(feature = "csv")]
-            CsvScan {
-                path,
-                file_info,
-                output_schema,
-                options,
-                predicate,
-            } => {
-                let local_predicates = partition_by_full_context(&mut acc_predicates, expr_arena);
-                let predicate = predicate_at_scan(acc_predicates, predicate, expr_arena);
-
-                let lp = if let (Some(predicate), Some(_)) = (predicate, options.n_rows) {
-                    let lp = CsvScan {
-                        path,
-                        file_info,
-                        output_schema,
-                        options,
-                        predicate: None,
-                    };
-                    let input = lp_arena.add(lp);
-                    Selection {
-                        input,
-                        predicate
-                    }
-                } else {
-                    CsvScan {
-                        path,
-                        file_info,
-                        output_schema,
-                        options,
-                        predicate,
+                let lp = match (predicate, &scan_type) {
+                    #[cfg(feature = "csv")]
+                    (Some(predicate), FileScan::Csv {..}) => {
+                        let lp = Scan {
+                            path,
+                            file_info,
+                            predicate: None,
+                            file_options: options,
+                            output_schema,
+                            scan_type
+                        };
+                        let input = lp_arena.add(lp);
+                        Selection {
+                            input,
+                            predicate
+                        }
+                    },
+                    _ => {
+                        Scan {
+                            path,
+                            file_info,
+                            predicate,
+                            file_options: options,
+                            output_schema,
+                            scan_type
+                        }
                     }
                 };
 
                 Ok(self.optional_apply_predicate(lp, local_predicates, lp_arena, expr_arena))
+
             }
             AnonymousScan {
                 function,
@@ -433,7 +397,7 @@ impl PredicatePushDown {
                         // join might create null values.
                         || has_aexpr(predicate, expr_arena, checks_nulls)
                         // only these join types produce null values
-                        && join_produces_null(&options.how) {
+                        && join_produces_null(&options.args.how) {
                         local_predicates.push(predicate);
                         continue;
                     }
@@ -466,7 +430,7 @@ impl PredicatePushDown {
                             filter_right = true;
                         }
                     }
-                    match (filter_left, filter_right, &options.how) {
+                    match (filter_left, filter_right, &options.args.how) {
                         // if not pushed down on one of the tables we have to do it locally.
                         (false, false, _) |
                         // if left join and predicate only available in right table,
@@ -621,7 +585,7 @@ impl PredicatePushDown {
                         let lp_top = stack_opt.optimize_loop(&mut [Box::new(SimplifyExprRule{})], expr_arena, lp_arena, lp_top).unwrap();
                         let PythonScan {options: _, predicate: Some(predicate)} = lp_arena.take(lp_top) else {unreachable!()};
 
-                        match super::super::pyarrow::predicate_to_pa(predicate, expr_arena) {
+                        match super::super::pyarrow::predicate_to_pa(predicate, expr_arena, Default::default()) {
                             // we we able to create a pyarrow string, mutate the options
                             Some(eval_str) => {
                                 options.predicate = Some(eval_str)

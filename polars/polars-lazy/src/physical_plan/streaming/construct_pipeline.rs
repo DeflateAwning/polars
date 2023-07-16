@@ -11,7 +11,7 @@ use polars_pipe::pipeline::{create_pipeline, get_dummy_operator, get_operator, P
 use polars_pipe::SExecutionContext;
 use polars_utils::IdxSize;
 
-use crate::physical_plan::planner::create_physical_expr;
+use crate::physical_plan::planner::{create_physical_expr, ExpressionConversionState};
 use crate::physical_plan::state::ExecutionState;
 use crate::physical_plan::streaming::tree::{PipelineNode, Tree};
 use crate::prelude::*;
@@ -38,8 +38,14 @@ fn to_physical_piped_expr(
     schema: Option<&SchemaRef>,
 ) -> PolarsResult<Arc<dyn PhysicalPipedExpr>> {
     // this is a double Arc<dyn> explore if we can create a single of it.
-    create_physical_expr(node, Context::Default, expr_arena, schema)
-        .map(|e| Arc::new(Wrap(e)) as Arc<dyn PhysicalPipedExpr>)
+    create_physical_expr(
+        node,
+        Context::Default,
+        expr_arena,
+        schema,
+        &mut ExpressionConversionState::new(false),
+    )
+    .map(|e| Arc::new(Wrap(e)) as Arc<dyn PhysicalPipedExpr>)
 }
 
 fn jit_insert_slice(
@@ -57,7 +63,11 @@ fn jit_insert_slice(
         Join {
             options:
                 JoinOptions {
-                    slice: Some((offset, len)),
+                    args:
+                        JoinArgs {
+                            slice: Some((offset, len)),
+                            ..
+                        },
                     ..
                 },
             ..
@@ -183,27 +193,8 @@ pub(super) fn construct(
     // also pipelines are not ready to receive inputs otherwise
     pipelines.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let Some(latest_sink) = final_sink else { return Ok(None) };
-    let schema = lp_arena.get(latest_sink).schema(lp_arena).into_owned();
-
-    let Some((_, mut most_left)) = pipelines.pop() else {unreachable!()};
-    while let Some((_, rhs)) = pipelines.pop() {
-        most_left = most_left.with_other_branch(rhs)
-    }
-    // keep the original around for formatting purposes
-    let original_lp = if fmt {
-        let original_lp = lp_arena.take(latest_sink);
-        let original_node = lp_arena.add(original_lp);
-        let original_lp = node_to_lp_cloned(original_node, expr_arena, lp_arena);
-        Some(original_lp)
-    } else {
-        None
-    };
-
-    // replace the part of the logical plan with a `MapFunction` that will execute the pipeline.
-    let pipeline_node = get_pipeline_node(lp_arena, most_left, schema, original_lp);
-
-    let insertion_location = match lp_arena.get(latest_sink) {
+    let Some(final_sink) = final_sink else { return Ok(None) };
+    let insertion_location = match lp_arena.get(final_sink) {
         FileSink {
             input,
             payload: FileSinkOptions { file_type, .. },
@@ -215,14 +206,32 @@ pub(super) fn construct(
                 *input
             } else {
                 // default case if the tree ended with a file_sink
-                latest_sink
+                final_sink
             }
         }
         _ => unreachable!(),
     };
+    // keep the original around for formatting purposes
+    let original_lp = if fmt {
+        let original_lp = node_to_lp_cloned(insertion_location, expr_arena, lp_arena);
+        Some(original_lp)
+    } else {
+        None
+    };
+
+    let Some((_, mut most_left)) = pipelines.pop() else {unreachable!()};
+    while let Some((_, rhs)) = pipelines.pop() {
+        most_left = most_left.with_other_branch(rhs)
+    }
+    // replace the part of the logical plan with a `MapFunction` that will execute the pipeline.
+    let schema = lp_arena
+        .get(insertion_location)
+        .schema(lp_arena)
+        .into_owned();
+    let pipeline_node = get_pipeline_node(lp_arena, most_left, schema, original_lp);
     lp_arena.replace(insertion_location, pipeline_node);
 
-    Ok(Some(latest_sink))
+    Ok(Some(final_sink))
 }
 
 impl SExecutionContext for ExecutionState {
@@ -250,10 +259,11 @@ fn get_pipeline_node(
     ALogicalPlan::MapFunction {
         function: FunctionNode::Pipeline {
             function: Arc::new(move |_df: DataFrame| {
-                let state = ExecutionState::new();
+                let mut state = ExecutionState::new();
                 if state.verbose() {
                     eprintln!("RUN STREAMING PIPELINE")
                 }
+                state.set_in_streaming_engine();
                 let state = Box::new(state) as Box<dyn SExecutionContext>;
                 pipeline.execute(state)
             }),

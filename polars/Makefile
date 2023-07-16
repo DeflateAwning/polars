@@ -1,46 +1,47 @@
 .DEFAULT_GOAL := help
 
+SHELL=/bin/bash
 BASE ?= main
 
-.PHONY: fmt check check-features clippy clippy-default test test-doc integration-tests
-
-fmt:
+.PHONY: fmt
+fmt:  ## Run rustfmt and dprint
 	cargo fmt --all
 	dprint fmt
 
-generate_test_files:
-	cargo run -p polars-cli "select * from read_csv('../examples/datasets/foods1.csv')" -o parquet > ../examples/datasets/foods1.parquet
-	cargo run -p polars-cli "select * from read_csv('../examples/datasets/foods1.csv')" -o arrow > ../examples/datasets/foods1.ipc
+.PHONY: check
+check:  ## Run cargo check with all features
+	cargo check --all-targets --all-features
 
-check:
-	cargo check --all-features \
-		-p polars-core \
-		-p polars-io \
-		-p polars-lazy \
-		-p polars-arrow \
-		-p polars-time \
-		-p polars-error \
-		-p polars-ops \
-		-p polars-sql
+.PHONY: clippy
+clippy:  ## Run clippy with all features
+	cargo clippy --all-targets --all-features
 
-clippy:
-	cargo clippy --all-features \
-		-p polars-core \
-		-p polars-io \
-		-p polars-lazy \
-		-p polars-arrow \
-		-p polars-utils \
-		-p polars-ops \
-		-p polars-error \
-		-p polars-row \
-		-p polars-time \
-		-p polars-sql
+.PHONY: clippy-default
+clippy-default:  ## Run clippy with default features
+	cargo clippy --all-targets
 
-clippy-default:
-	cargo clippy
+.PHONY: pre-commit
+pre-commit: fmt clippy clippy-default  ## Run autoformatting and linting
 
+.PHONY: check-features
+check-features:  ## Run cargo check for feature flag combinations (warning: slow)
+	cargo hack check --each-feature --no-dev-deps
+
+.PHONY: miri
+miri:  ## Run miri
+	# not tested on all features because miri does not support SIMD
+	# some tests are also filtered, because miri cannot deal with the rayon threadpool
+	# we ignore leaks because the thread pool of rayon is never killed.
+	MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-ignore-leaks -Zmiri-disable-stacked-borrows" \
+	POLARS_ALLOW_EXTENSION=1 \
+	cargo miri test \
+	    --no-default-features \
+	    --features object \
+	    -p polars-core \
+	    -p polars-arrow
+
+.PHONY: test
 test:  ## Run tests
-	POLARS_NO_STREAMING_GROUPBY=1 POLARS_MAX_THREADS=4 cargo t -p polars-core test_4_threads
 	cargo test --all-features \
 		-p polars-lazy \
 		-p polars-io \
@@ -53,43 +54,34 @@ test:  ## Run tests
 		-- \
 		--test-threads=2
 
-integration-tests:
-	cargo t --all-features --test it -- --test-threads=2
+.PHONY: integration-tests
+integration-tests:  ## Run integration tests
+	cargo test --all-features --test it
 
-miri:
-	# not tested on all features because miri does not support SIMD
-	# some tests are also filtered, because miri cannot deal with the rayon threadpool
-	# we ignore leaks because the thread pool of rayon is never killed.
-	MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-ignore-leaks -Zmiri-disable-stacked-borrows" \
-	POLARS_ALLOW_EXTENSION=1 \
-	cargo miri test \
-	    --no-default-features \
-	    --features object \
-	    -p polars-core \
-	    -p polars-arrow \
-	    --
-
-test-doc:
+.PHONY: test-doc
+test-doc:  ## Run doc examples
 	cargo test --doc \
 	    -p polars-lazy \
 	    -p polars-io \
 	    -p polars-core \
 	    -p polars-arrow \
-			-p polars-sql
+		-p polars-sql
 
-pre-commit: fmt clippy clippy-default  ## Run autoformatting and linting
+.PHONY: generate_test_files
+generate_test_files:  ## Generate some datasets
+	cargo run -p polars-cli "select * from read_csv('../examples/datasets/foods1.csv')" -o parquet > ../examples/datasets/foods1.parquet
+	cargo run -p polars-cli "select * from read_csv('../examples/datasets/foods1.csv')" -o arrow > ../examples/datasets/foods1.ipc
 
-
-check-features:
-	cargo hack check --each-feature --no-dev-deps --features private 
-
-bench-save:
+.PHONY: bench-save
+bench-save:  ## Run benchmark and save
 	cargo bench --features=random --bench $(BENCH) -- --save-baseline $(SAVE)
 
-bench-cmp:
+.PHONY: bench-cmp
+bench-cmp:  ## Run benchmark and compare
 	cargo bench --features=random --bench $(BENCH) -- --load-baseline $(FEAT) --baseline $(BASE)
 
-doctest:
+.PHONY: doctest
+doctest:  ## Check that documentation builds
 	cargo doc --all-features -p polars-arrow
 	cargo doc --all-features -p polars-utils
 	cargo doc --features=docs-selection -p polars-core
@@ -100,36 +92,26 @@ doctest:
 	cargo doc --features=docs-selection -p polars
 	cargo doc --all-features -p polars-sql
 
-publish:
-#	cargo publish --allow-dirty -p polars-error
-#	sleep 20
-#	cargo publish --allow-dirty -p polars-utils
-#	sleep 20
-#	cargo publish --allow-dirty -p polars-row
-#	sleep 20
+.PHONY: publish
+publish:  ## Publish Polars crates
+	cargo publish --allow-dirty -p polars-error
+	cargo publish --allow-dirty -p polars-utils
+	cargo publish --allow-dirty -p polars-row
 	cargo publish --allow-dirty -p polars-arrow
-	sleep 20
+	cargo publish --allow-dirty -p polars-json
 	cargo publish --allow-dirty -p polars-core
-	sleep 20
 	cargo publish --allow-dirty -p polars-ops
-	sleep 20
 	cargo publish --allow-dirty -p polars-time
-	sleep 20
 	cargo publish --allow-dirty -p polars-io
-	sleep 20
 	cargo publish --allow-dirty -p polars-plan
-	sleep 20
 	cargo publish --allow-dirty -p polars-pipe
-	sleep 20
 	cargo publish --allow-dirty -p polars-lazy
-	sleep 20
 	cargo publish --allow-dirty -p polars-algo
-	sleep 20
 	cargo publish --allow-dirty -p polars-sql
-	sleep 20
 	cargo publish --allow-dirty -p polars
+	cd .. && cargo publish --allow-dirty -p polars-cli
 
 .PHONY: help
 help:  ## Display this help screen
-	@echo -e "\033[1mAvailable commands:\033[0m\n"
+	@echo -e "\033[1mAvailable commands:\033[0m"
 	@grep -E '^[a-z.A-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}' | sort

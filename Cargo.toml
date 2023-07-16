@@ -1,28 +1,18 @@
 [workspace]
+resolver = "2"
 members = [
   "polars",
   "polars-cli",
-  "polars/polars-core",
-  "polars/polars-io",
-  "polars/polars-time",
-  "polars/polars-utils",
-  "polars/polars-ops",
-  "polars/polars-algo",
-  "polars/polars-lazy",
-  "polars/polars-lazy/polars-plan",
-  "polars/polars-lazy/polars-pipe",
-  "polars/polars-sql",
-  "polars/polars-error",
-  "polars/polars-row",
-  "examples/read_csv",
-  "examples/read_parquet",
-  "examples/read_parquet_cloud",
-  "examples/string_filter",
-  "examples/python_rust_compiled_function",
+  "polars/polars-*",
+  "polars/polars-lazy/polars-*",
+  "examples/*",
+]
+exclude = [
+  "examples/datasets",
 ]
 
 [workspace.package]
-version = "0.28.0"
+version = "0.31.1"
 
 [workspace.dependencies]
 rayon = "1.6"
@@ -30,22 +20,24 @@ thiserror = "^1"
 num-traits = "0.2"
 ahash = "0.8"
 xxhash-rust = { version = "0.8.6", features = ["xxh3"] }
-hashbrown = { version = "0.13.1", features = ["rayon", "ahash"] }
+hashbrown = { version = "0.14.0", features = ["rayon", "ahash"] }
+indexmap = { version = "2", features = ["std"] }
 bitflags = "1.3"
 once_cell = "1"
 memchr = "2"
 smartstring = { version = "1" }
 multiversion = "0.7"
 either = "1.8"
+strum_macros = "0.25"
 
 [workspace.dependencies.arrow]
 package = "arrow2"
 # git = "https://github.com/jorgecarleitao/arrow2"
-git = "https://github.com/ritchie46/arrow2"
-# rev = "1491c6e8f4fd100f53c358e4f3ef1536d9e75090"
+# git = "https://github.com/ritchie46/arrow2"
+# rev = "2d2e7053f9a50810bfe9cecff25ab39089aef98e"
 # path = "../arrow2"
-branch = "polars_2023-04-29"
-version = "0.17"
+# branch = "polars_2023-06-26"
+version = "0.17.2"
 default-features = false
 features = [
   "compute_aggregate",
@@ -60,4 +52,4 @@ features = [
 ]
 [patch.crates-io]
 # packed_simd_2 = { git = "https://github.com/rust-lang/packed_simd", rev = "e57c7ba11386147e6d2cbad7c88f376aab4bdc86" }
-simd-json = { git = "https://github.com/ritchie46/simd-json", branch = "alignment" }
+# simd-json = { git = "https://github.com/ritchie46/simd-json", branch = "alignment" }

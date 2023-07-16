@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sys
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta
 from typing import TYPE_CHECKING
 
 import pytest
@@ -83,7 +83,7 @@ def test_strptime_extract_times(
     assert_series_equal(getattr(s.dt, unit_attr)(), expected)
 
 
-@pytest.mark.parametrize("time_zone", [None, "Asia/Kathmandu", "+03:00"])
+@pytest.mark.parametrize("time_zone", [None, "Asia/Kathmandu"])
 @pytest.mark.parametrize(
     ("attribute", "expected"),
     [
@@ -99,7 +99,7 @@ def test_dt_date_and_time(
     assert result == expected
 
 
-@pytest.mark.parametrize("time_zone", [None, "Asia/Kathmandu", "+03:00"])
+@pytest.mark.parametrize("time_zone", [None, "Asia/Kathmandu"])
 @pytest.mark.parametrize("time_unit", ["us", "ns", "ms"])
 def test_dt_datetime(time_zone: str | None, time_unit: TimeUnit) -> None:
     ser = (
@@ -111,6 +111,58 @@ def test_dt_datetime(time_zone: str | None, time_unit: TimeUnit) -> None:
     expected = datetime(2022, 1, 1, 23)
     assert result.dtype == pl.Datetime(time_unit, None)
     assert result.item() == expected
+
+
+@pytest.mark.parametrize(
+    ("time_zone", "expected"),
+    [
+        (None, True),
+        ("Asia/Kathmandu", False),
+        ("UTC", True),
+    ],
+)
+@pytest.mark.parametrize("attribute", ["datetime", "date"])
+def test_local_datetime_sortedness(
+    time_zone: str | None, expected: bool, attribute: str
+) -> None:
+    ser = (pl.Series([datetime(2022, 1, 1, 23)]).dt.replace_time_zone(time_zone)).sort()
+    result = getattr(ser.dt, attribute)()
+    assert result.flags["SORTED_ASC"] == expected
+    assert result.flags["SORTED_DESC"] is False
+
+
+@pytest.mark.parametrize("time_zone", [None, "Asia/Kathmandu", "UTC"])
+def test_local_time_sortedness(time_zone: str | None) -> None:
+    ser = (pl.Series([datetime(2022, 1, 1, 23)]).dt.replace_time_zone(time_zone)).sort()
+    result = ser.dt.time()
+    assert result.flags["SORTED_ASC"] is False
+    assert result.flags["SORTED_DESC"] is False
+
+
+@pytest.mark.parametrize(
+    ("time_zone", "offset", "expected"),
+    [
+        (None, "1d", True),
+        ("Asia/Kathmandu", "1d", False),
+        ("UTC", "1d", True),
+        (None, "1mo", True),
+        ("Asia/Kathmandu", "1mo", False),
+        ("UTC", "1mo", True),
+        (None, "1w", True),
+        ("Asia/Kathmandu", "1w", False),
+        ("UTC", "1w", True),
+        (None, "1h", True),
+        ("Asia/Kathmandu", "1h", True),
+        ("UTC", "1h", True),
+    ],
+)
+def test_offset_by_sortedness(
+    time_zone: str | None, offset: str, expected: bool
+) -> None:
+    ser = (pl.Series([datetime(2022, 1, 1, 23)]).dt.replace_time_zone(time_zone)).sort()
+    result = ser.dt.offset_by(offset)
+    assert result.flags["SORTED_ASC"] == expected
+    assert result.flags["SORTED_DESC"] is False
 
 
 def test_dt_datetime_date_time_invalid() -> None:
@@ -138,16 +190,21 @@ def test_dt_datetime_date_time_invalid() -> None:
     ],
 )
 @pytest.mark.parametrize(
-    "tzinfo", [None, ZoneInfo("Asia/Kathmandu"), timezone(timedelta(hours=1))]
+    ("tzinfo", "time_zone"),
+    [
+        (None, None),
+        (ZoneInfo("Asia/Kathmandu"), "Asia/Kathmandu"),
+    ],
 )
 @pytest.mark.parametrize("time_unit", ["ms", "us", "ns"])
 def test_month_start_datetime(
     dt: datetime,
     expected: datetime,
     time_unit: TimeUnit,
-    tzinfo: ZoneInfo | timezone | None,
+    tzinfo: ZoneInfo | None,
+    time_zone: str | None,
 ) -> None:
-    ser = pl.Series([dt.replace(tzinfo=tzinfo)]).dt.cast_time_unit(time_unit)
+    ser = pl.Series([dt]).dt.replace_time_zone(time_zone).dt.cast_time_unit(time_unit)
     result = ser.dt.month_start().item()
     assert result == expected.replace(tzinfo=tzinfo)
 
@@ -178,16 +235,21 @@ def test_month_start_date(dt: date, expected: date) -> None:
     ],
 )
 @pytest.mark.parametrize(
-    "tzinfo", [None, ZoneInfo("Asia/Kathmandu"), timezone(timedelta(hours=1))]
+    ("tzinfo", "time_zone"),
+    [
+        (None, None),
+        (ZoneInfo("Asia/Kathmandu"), "Asia/Kathmandu"),
+    ],
 )
 @pytest.mark.parametrize("time_unit", ["ms", "us", "ns"])
 def test_month_end_datetime(
     dt: datetime,
     expected: datetime,
     time_unit: TimeUnit,
-    tzinfo: ZoneInfo | timezone | None,
+    tzinfo: ZoneInfo | None,
+    time_zone: str | None,
 ) -> None:
-    ser = pl.Series([dt.replace(tzinfo=tzinfo)]).dt.cast_time_unit(time_unit)
+    ser = pl.Series([dt]).dt.replace_time_zone(time_zone).dt.cast_time_unit(time_unit)
     result = ser.dt.month_end().item()
     assert result == expected.replace(tzinfo=tzinfo)
 
@@ -217,6 +279,87 @@ def test_month_start_end_invalid() -> None:
         match=r"`month_end` operation not supported for dtype `time` \(expected: date/datetime\)",
     ):
         ser.dt.month_end()
+
+
+@pytest.mark.parametrize("time_unit", ["ms", "us", "ns"])
+def test_base_utc_offset(time_unit: TimeUnit) -> None:
+    ser = pl.date_range(
+        datetime(2011, 12, 29),
+        datetime(2012, 1, 1),
+        "2d",
+        time_zone="Pacific/Apia",
+        eager=True,
+    ).dt.cast_time_unit(time_unit)
+    result = ser.dt.base_utc_offset().rename("base_utc_offset")
+    expected = pl.Series(
+        "base_utc_offset",
+        [-11 * 3600 * 1000, 13 * 3600 * 1000],
+        dtype=pl.Duration("ms"),
+    )
+    assert_series_equal(result, expected)
+
+
+def test_base_utc_offset_lazy_schema() -> None:
+    ser = pl.date_range(
+        datetime(2020, 10, 25),
+        datetime(2020, 10, 26),
+        time_zone="Europe/London",
+        eager=True,
+    )
+    df = pl.DataFrame({"ts": ser}).lazy()
+    result = df.with_columns(base_utc_offset=pl.col("ts").dt.base_utc_offset()).schema
+    expected = {
+        "ts": pl.Datetime(time_unit="us", time_zone="Europe/London"),
+        "base_utc_offset": pl.Duration(time_unit="ms"),
+    }
+    assert result == expected
+
+
+def test_base_utc_offset_invalid() -> None:
+    ser = pl.date_range(datetime(2020, 10, 25), datetime(2020, 10, 26), eager=True)
+    with pytest.raises(
+        InvalidOperationError,
+        match=r"`base_utc_offset` operation not supported for dtype `datetime\[μs\]` \(expected: time-zone-aware datetime\)",
+    ):
+        ser.dt.base_utc_offset().rename("base_utc_offset")
+
+
+@pytest.mark.parametrize("time_unit", ["ms", "us", "ns"])
+def test_dst_offset(time_unit: TimeUnit) -> None:
+    ser = pl.date_range(
+        datetime(2020, 10, 25),
+        datetime(2020, 10, 26),
+        time_zone="Europe/London",
+        eager=True,
+    ).dt.cast_time_unit(time_unit)
+    result = ser.dt.dst_offset().rename("dst_offset")
+    expected = pl.Series("dst_offset", [3_600 * 1_000, 0], dtype=pl.Duration("ms"))
+    assert_series_equal(result, expected)
+
+
+def test_dst_offset_lazy_schema() -> None:
+    ser = pl.date_range(
+        datetime(2020, 10, 25),
+        datetime(2020, 10, 26),
+        time_zone="Europe/London",
+        eager=True,
+    )
+    df = pl.DataFrame({"ts": ser}).lazy()
+    result = df.with_columns(dst_offset=pl.col("ts").dt.dst_offset()).schema
+    expected = {
+        "ts": pl.Datetime(time_unit="us", time_zone="Europe/London"),
+        "dst_offset": pl.Duration(time_unit="ms"),
+    }
+    assert result == expected
+
+
+def test_dst_offset_invalid() -> None:
+    ser = pl.date_range(datetime(2020, 10, 25), datetime(2020, 10, 26), eager=True)
+    with pytest.raises(
+        InvalidOperationError,
+        match=r"`dst_offset` operation not supported for dtype `datetime\[μs\]` \(expected: time-zone-aware datetime\)",
+    ):
+        ser.dt.dst_offset().rename("dst_offset")
 
 
 @pytest.mark.parametrize(
@@ -288,10 +431,9 @@ def test_truncate(
         start,
         stop,
         timedelta(minutes=30),
-        name=f"dates[{time_unit}]",
         time_unit=time_unit,
         eager=True,
-    )
+    ).alias(f"dates[{time_unit}]")
 
     # can pass strings and time-deltas
     out = s.dt.truncate(every)
@@ -323,10 +465,9 @@ def test_round(
         start,
         stop,
         timedelta(minutes=30),
-        name=f"dates[{time_unit}]",
         time_unit=time_unit,
         eager=True,
-    )
+    ).alias(f"dates[{time_unit}]")
 
     # can pass strings and time-deltas
     out = s.dt.round(every)
@@ -372,18 +513,16 @@ def test_epoch_matches_timestamp() -> None:
 
 
 @pytest.mark.parametrize(
-    ("tzinfo", "expected_time_zone"),
+    ("tzinfo", "time_zone"),
     [(None, None), (ZoneInfo("Asia/Kathmandu"), "Asia/Kathmandu")],
 )
-def test_date_time_combine(
-    tzinfo: ZoneInfo | None, expected_time_zone: str | None
-) -> None:
+def test_date_time_combine(tzinfo: ZoneInfo | None, time_zone: str | None) -> None:
     # Define a DataFrame with columns for datetime, date, and time
     df = pl.DataFrame(
         {
             "dtm": [
-                datetime(2022, 12, 31, 10, 30, 45, tzinfo=tzinfo),
-                datetime(2023, 7, 5, 23, 59, 59, tzinfo=tzinfo),
+                datetime(2022, 12, 31, 10, 30, 45),
+                datetime(2023, 7, 5, 23, 59, 59),
             ],
             "dt": [
                 date(2022, 10, 10),
@@ -395,6 +534,7 @@ def test_date_time_combine(
             ],
         }
     )
+    df = df.with_columns(pl.col("dtm").dt.replace_time_zone(time_zone))
 
     # Combine datetime/date with time
     df = df.select(
@@ -423,7 +563,7 @@ def test_date_time_combine(
     assert df.to_dict(False) == expected_dict
 
     expected_schema = {
-        "d1": pl.Datetime("us", expected_time_zone),
+        "d1": pl.Datetime("us", time_zone),
         "d2": pl.Datetime("us"),
         "d3": pl.Datetime("us"),
     }
@@ -436,25 +576,19 @@ def test_combine_unsupported_types() -> None:
 
 
 @pytest.mark.parametrize("time_unit", ["ms", "us", "ns"])
-@pytest.mark.parametrize(
-    ("tzinfo", "expected_time_zone"),
-    [
-        (ZoneInfo("Asia/Kathmandu"), "Asia/Kathmandu"),
-        (None, None),
-    ],
-)
+@pytest.mark.parametrize("time_zone", ["Asia/Kathmandu", None])
 def test_combine_lazy_schema_datetime(
-    tzinfo: ZoneInfo | None,
-    expected_time_zone: str | None,
+    time_zone: str | None,
     time_unit: TimeUnit,
 ) -> None:
-    df = pl.DataFrame({"ts": pl.Series([datetime(2020, 1, 1, tzinfo=tzinfo)])})
+    df = pl.DataFrame({"ts": pl.Series([datetime(2020, 1, 1)])})
+    df = df.with_columns(pl.col("ts").dt.replace_time_zone(time_zone))
     result = (
         df.lazy()
         .select(pl.col("ts").dt.combine(time(1, 2, 3), time_unit=time_unit))
         .dtypes
     )
-    expected = [pl.Datetime(time_unit, expected_time_zone)]
+    expected = [pl.Datetime(time_unit, time_zone)]
     assert result == expected
 
 
@@ -537,6 +671,18 @@ def test_negative_offset_by_err_msg_8464() -> None:
         ComputeError, match=r"cannot advance '2022-03-30 00:00:00' by -1 month\(s\)"
     ):
         pl.Series([datetime(2022, 3, 30)]).dt.offset_by("-1mo")
+
+
+def test_offset_by_truncate_sorted_flag() -> None:
+    s = pl.Series([datetime(2001, 1, 1), datetime(2001, 1, 2)])
+    s = s.set_sorted()
+
+    assert s.flags["SORTED_ASC"]
+    s1 = s.dt.offset_by("1d")
+    assert s1.to_list() == [datetime(2001, 1, 2), datetime(2001, 1, 3)]
+    assert s1.flags["SORTED_ASC"]
+    s2 = s1.dt.truncate("1mo")
+    assert s2.flags["SORTED_ASC"]
 
 
 @pytest.mark.parametrize(

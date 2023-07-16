@@ -14,8 +14,6 @@ use polars_arrow::data_types::IsFloat;
 use polars_arrow::export::arrow;
 #[cfg(feature = "rolling_window")]
 use polars_arrow::kernels::rolling;
-#[cfg(feature = "rolling_window")]
-use polars_arrow::prelude::QuantileInterpolOptions;
 use polars_core::prelude::*;
 
 #[cfg(feature = "rolling_window")]
@@ -38,6 +36,8 @@ pub struct RollingOptions {
     pub by: Option<String>,
     /// The closed window of that time window if given
     pub closed_window: Option<ClosedWindow>,
+    /// Optional parameters for the rolling function
+    pub fn_params: DynArgs,
 }
 
 #[cfg(feature = "rolling_window")]
@@ -50,6 +50,7 @@ impl Default for RollingOptions {
             center: false,
             by: None,
             closed_window: None,
+            fn_params: None,
         }
     }
 }
@@ -70,6 +71,7 @@ pub struct RollingOptionsImpl<'a> {
     pub tu: Option<TimeUnit>,
     pub tz: Option<&'a TimeZone>,
     pub closed_window: Option<ClosedWindow>,
+    pub fn_params: DynArgs,
 }
 
 #[cfg(feature = "rolling_window")]
@@ -90,6 +92,7 @@ impl From<RollingOptions> for RollingOptionsImpl<'static> {
             tu: None,
             tz: None,
             closed_window: None,
+            fn_params: options.fn_params,
         }
     }
 }
@@ -108,6 +111,7 @@ impl From<RollingOptions> for RollingOptionsFixedWindow {
             min_periods: options.min_periods,
             weights: options.weights,
             center: options.center,
+            fn_params: options.fn_params,
         }
     }
 }
@@ -124,6 +128,7 @@ impl Default for RollingOptionsImpl<'static> {
             tu: None,
             tz: None,
             closed_window: None,
+            fn_params: None,
         }
     }
 }
@@ -142,6 +147,7 @@ impl<'a> From<RollingOptionsImpl<'a>> for RollingOptionsFixedWindow {
             min_periods: options.min_periods,
             weights: options.weights,
             center: options.center,
+            fn_params: options.fn_params,
         }
     }
 }
@@ -183,12 +189,7 @@ pub trait RollingAgg {
     /// Apply a rolling quantile (moving quantile) over the values in this array.
     /// A window of length `window_size` will traverse the array. The values that fill this window
     /// will (optionally) be weighted according to the `weights` vector.
-    fn rolling_quantile(
-        &self,
-        quantile: f64,
-        interpolation: QuantileInterpolOptions,
-        options: RollingOptionsImpl,
-    ) -> PolarsResult<Series>;
+    fn rolling_quantile(&self, options: RollingOptionsImpl) -> PolarsResult<Series>;
 
     /// Apply a rolling var (moving var) over the values in this array.
     /// A window of length `window_size` will traverse the array. The values that fill this window
@@ -219,23 +220,31 @@ fn check_input(window_size: usize, min_periods: usize) -> PolarsResult<()> {
 fn rolling_agg<T>(
     ca: &ChunkedArray<T>,
     options: RollingOptionsImpl,
-    rolling_agg_fn: &dyn Fn(&[T::Native], usize, usize, bool, Option<&[f64]>) -> ArrayRef,
+    rolling_agg_fn: &dyn Fn(
+        &[T::Native],
+        usize,
+        usize,
+        bool,
+        Option<&[f64]>,
+        DynArgs,
+    ) -> PolarsResult<ArrayRef>,
     rolling_agg_fn_nulls: &dyn Fn(
         &PrimitiveArray<T::Native>,
         usize,
         usize,
         bool,
         Option<&[f64]>,
+        DynArgs,
     ) -> ArrayRef,
     rolling_agg_fn_dynamic: Option<
         &dyn Fn(
             &[T::Native],
             Duration,
-            Duration,
             &[i64],
             ClosedWindow,
             TimeUnit,
             Option<&TimeZone>,
+            DynArgs,
         ) -> PolarsResult<ArrayRef>,
     >,
 ) -> PolarsResult<Series>
@@ -260,13 +269,15 @@ where
                 options.min_periods,
                 options.center,
                 options.weights.as_deref(),
-            ),
+                options.fn_params,
+            )?,
             _ => rolling_agg_fn_nulls(
                 arr,
                 options.window_size,
                 options.min_periods,
                 options.center,
                 options.weights.as_deref(),
+                options.fn_params,
             ),
         })
     } else {
@@ -275,16 +286,23 @@ where
         }
         let values = arr.values().as_slice();
         let duration = options.window_size;
+        polars_ensure!(duration.duration_ns() > 0 && !duration.negative, ComputeError:"window size should be strictly positive");
         let tu = options.tu.unwrap();
         let by = options.by.unwrap();
         let closed_window = options.closed_window.expect("closed window  must be set");
-        let mut offset = duration;
-        offset.negative = true;
         let func = rolling_agg_fn_dynamic.expect(
             "'rolling by' not yet supported for this expression, consider using 'groupby_rolling'",
         );
 
-        func(values, duration, offset, by, closed_window, tu, options.tz)
+        func(
+            values,
+            duration,
+            by,
+            closed_window,
+            tu,
+            options.tz,
+            options.fn_params,
+        )
     }?;
     Series::try_from((ca.name(), arr))
 }

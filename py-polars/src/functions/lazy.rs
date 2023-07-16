@@ -21,11 +21,6 @@ macro_rules! set_unwrapped_or_0 {
 }
 
 #[pyfunction]
-pub fn arange(start: PyExpr, end: PyExpr, step: i64) -> PyExpr {
-    dsl::arange(start.inner, end.inner, step).into()
-}
-
-#[pyfunction]
 pub fn rolling_corr(
     x: PyExpr,
     y: PyExpr,
@@ -118,7 +113,12 @@ pub fn cols(names: Vec<String>) -> PyExpr {
 }
 
 #[pyfunction]
-pub fn concat_lf(seq: &PyAny, rechunk: bool, parallel: bool) -> PyResult<PyLazyFrame> {
+pub fn concat_lf(
+    seq: &PyAny,
+    rechunk: bool,
+    parallel: bool,
+    to_supertypes: bool,
+) -> PyResult<PyLazyFrame> {
     let len = seq.len()?;
     let mut lfs = Vec::with_capacity(len);
 
@@ -128,7 +128,15 @@ pub fn concat_lf(seq: &PyAny, rechunk: bool, parallel: bool) -> PyResult<PyLazyF
         lfs.push(lf);
     }
 
-    let lf = dsl::concat(lfs, rechunk, parallel).map_err(PyPolarsErr::from)?;
+    let lf = dsl::concat(
+        lfs,
+        UnionArgs {
+            rechunk,
+            parallel,
+            to_supertypes,
+        },
+    )
+    .map_err(PyPolarsErr::from)?;
     Ok(lf.into())
 }
 
@@ -177,13 +185,21 @@ pub fn date_range_lazy(
     end: PyExpr,
     every: &str,
     closed: Wrap<ClosedWindow>,
-    name: String,
+    time_unit: Option<Wrap<TimeUnit>>,
     time_zone: Option<TimeZone>,
 ) -> PyExpr {
     let start = start.inner;
     let end = end.inner;
     let every = Duration::parse(every);
-    dsl::functions::date_range(name, start, end, every, closed.0, time_zone).into()
+    dsl::functions::date_range(
+        start,
+        end,
+        every,
+        closed.0,
+        time_unit.map(|x| x.0),
+        time_zone,
+    )
+    .into()
 }
 
 #[pyfunction]
@@ -227,6 +243,13 @@ pub fn diag_concat_lf(lfs: &PyAny, rechunk: bool, parallel: bool) -> PyResult<Py
 
     let lf = dsl::functions::diag_concat_lf(lfs, rechunk, parallel).map_err(PyPolarsErr::from)?;
     Ok(lf.into())
+}
+
+#[pyfunction]
+pub fn concat_expr(e: Vec<PyExpr>, rechunk: bool) -> PyResult<PyExpr> {
+    let e = e.to_exprs();
+    let e = dsl::functions::concat_expr(e, rechunk).map_err(PyPolarsErr::from)?;
+    Ok(e.into())
 }
 
 #[pyfunction]
@@ -290,7 +313,7 @@ pub fn last() -> PyExpr {
 
 #[pyfunction]
 pub fn lit(value: &PyAny, allow_object: bool) -> PyResult<PyExpr> {
-    if let Ok(true) = value.is_instance_of::<PyBool>() {
+    if value.is_instance_of::<PyBool>() {
         let val = value.extract::<bool>().unwrap();
         Ok(dsl::lit(val).into())
     } else if let Ok(int) = value.downcast::<PyInt>() {
@@ -357,18 +380,6 @@ pub fn map_mul(
 }
 
 #[pyfunction]
-pub fn max_exprs(exprs: Vec<PyExpr>) -> PyExpr {
-    let exprs = exprs.to_exprs();
-    dsl::max_exprs(exprs).into()
-}
-
-#[pyfunction]
-pub fn min_exprs(exprs: Vec<PyExpr>) -> PyExpr {
-    let exprs = exprs.to_exprs();
-    dsl::min_exprs(exprs).into()
-}
-
-#[pyfunction]
 pub fn pearson_corr(a: PyExpr, b: PyExpr, ddof: u8) -> PyExpr {
     dsl::pearson_corr(a.inner, b.inner, ddof).into()
 }
@@ -382,34 +393,25 @@ pub fn reduce(lambda: PyObject, exprs: Vec<PyExpr>) -> PyExpr {
 }
 
 #[pyfunction]
-pub fn repeat(value: &PyAny, n_times: PyExpr) -> PyResult<PyExpr> {
-    if let Ok(true) = value.is_instance_of::<PyBool>() {
-        let val = value.extract::<bool>().unwrap();
-        Ok(dsl::repeat(val, n_times.inner).into())
-    } else if let Ok(int) = value.downcast::<PyInt>() {
-        let val = int.extract::<i64>().unwrap();
+pub fn repeat(value: PyExpr, n: PyExpr, dtype: Option<Wrap<DataType>>) -> PyResult<PyExpr> {
+    let mut value = value.inner;
+    let n = n.inner;
 
-        if val >= i32::MIN as i64 && val <= i32::MAX as i64 {
-            Ok(dsl::repeat(val as i32, n_times.inner).into())
-        } else {
-            Ok(dsl::repeat(val, n_times.inner).into())
-        }
-    } else if let Ok(float) = value.downcast::<PyFloat>() {
-        let val = float.extract::<f64>().unwrap();
-        Ok(dsl::repeat(val, n_times.inner).into())
-    } else if let Ok(pystr) = value.downcast::<PyString>() {
-        let val = pystr
-            .to_str()
-            .expect("could not transform Python string to Rust Unicode");
-        Ok(dsl::repeat(val, n_times.inner).into())
-    } else if value.is_none() {
-        Ok(dsl::repeat(Null {}, n_times.inner).into())
-    } else {
-        Err(PyValueError::new_err(format!(
-            "could not convert value {:?} as a Literal",
-            value.str()?
-        )))
+    if let Some(dtype) = dtype {
+        value = value.cast(dtype.0);
     }
+
+    if let Expr::Literal(lv) = &value {
+        let av = lv.to_anyvalue().unwrap();
+        // Integer inputs that fit in Int32 are parsed as such
+        if let DataType::Int64 = av.dtype() {
+            let int_value = av.try_extract::<i64>().unwrap();
+            if int_value >= i32::MIN as i64 && int_value <= i32::MAX as i64 {
+                value = value.cast(DataType::Int32);
+            }
+        }
+    }
+    Ok(dsl::repeat(value, n).into())
 }
 
 #[pyfunction]
@@ -425,7 +427,21 @@ pub fn spearman_rank_corr(a: PyExpr, b: PyExpr, ddof: u8, propagate_nans: bool) 
 }
 
 #[pyfunction]
-pub fn sum_exprs(exprs: Vec<PyExpr>) -> PyExpr {
-    let exprs = exprs.to_exprs();
-    dsl::sum_exprs(exprs).into()
+pub fn time_range_lazy(
+    start: PyExpr,
+    end: PyExpr,
+    every: &str,
+    closed: Wrap<ClosedWindow>,
+) -> PyExpr {
+    let start = start.inner;
+    let end = end.inner;
+    let every = Duration::parse(every);
+    dsl::functions::time_range(start, end, every, closed.0).into()
+}
+
+#[pyfunction]
+#[cfg(feature = "sql")]
+pub fn sql_expr(sql: &str) -> PyResult<PyExpr> {
+    let expr = polars::sql::sql_expr(sql).map_err(PyPolarsErr::from)?;
+    Ok(expr.into())
 }

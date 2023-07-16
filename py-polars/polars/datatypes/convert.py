@@ -16,6 +16,7 @@ from typing import (
     Optional,
     TypeVar,
     Union,
+    get_args,
     overload,
 )
 
@@ -54,14 +55,6 @@ from polars.dependencies import pyarrow as pa
 with contextlib.suppress(ImportError):  # Module not available when building docs
     from polars.polars import dtype_str_repr as _dtype_str_repr
 
-if sys.version_info >= (3, 8):
-    from typing import get_args
-else:
-    # pass-through (only impact is that under 3.7 we'll end-up doing
-    # standard inference for dataclass fields with an option/union)
-    def get_args(tp: Any) -> Any:
-        return tp
-
 
 OptionType = type(Optional[type])
 if sys.version_info >= (3, 10):
@@ -72,12 +65,9 @@ else:
     UnionType = type(Union[int, float])
 
 if TYPE_CHECKING:
-    from polars.type_aliases import PolarsDataType, PythonDataType, SchemaDict, TimeUnit
+    from typing import Literal
 
-    if sys.version_info >= (3, 8):
-        from typing import Literal
-    else:
-        from typing_extensions import Literal
+    from polars.type_aliases import PolarsDataType, PythonDataType, SchemaDict, TimeUnit
 
 
 T = TypeVar("T")
@@ -139,6 +129,21 @@ def map_py_type_to_dtype(python_dtype: PythonDataType | type[object]) -> PolarsD
         return Object
     if python_dtype is None.__class__:
         return Null
+
+    # cover generic typing aliases, such as 'list[str]'
+    if hasattr(python_dtype, "__origin__") and hasattr(python_dtype, "__args__"):
+        base_type = python_dtype.__origin__
+        if base_type is not None:
+            dtype = map_py_type_to_dtype(base_type)
+            nested = python_dtype.__args__
+            if len(nested) == 1:
+                nested = nested[0]
+            return (
+                dtype
+                if nested is None
+                else dtype(map_py_type_to_dtype(nested))  # type: ignore[operator]
+            )
+
     raise TypeError("Invalid type")
 
 
@@ -386,7 +391,7 @@ def py_type_to_dtype(
 
 
 def py_type_to_dtype(
-    data_type: Any, raise_unmatched: bool = True
+    data_type: Any, raise_unmatched: bool = True, allow_strings: bool = False
 ) -> PolarsDataType | None:
     """Convert a Python dtype (or type annotation) to a Polars dtype."""
     if isinstance(data_type, ForwardRef):
@@ -398,6 +403,8 @@ def py_type_to_dtype(
             if isinstance(annotation, str)  # type: ignore[redundant-expr]
             else annotation
         )
+    elif type(data_type).__name__ == "InitVar":
+        data_type = data_type.type
 
     if is_polars_dtype(data_type):
         return data_type
@@ -409,8 +416,11 @@ def py_type_to_dtype(
         if len(possible_types) == 1:
             data_type = possible_types[0]
 
-    elif isinstance(data_type, str):
-        data_type = DataTypeMappings.REPR_TO_DTYPE.get(data_type, data_type)
+    elif allow_strings and isinstance(data_type, str):
+        data_type = DataTypeMappings.REPR_TO_DTYPE.get(
+            re.sub(r"^(?:dataclasses\.)?InitVar\[(.+)\]$", r"\1", data_type),
+            data_type,
+        )
         if is_polars_dtype(data_type):
             return data_type
     try:

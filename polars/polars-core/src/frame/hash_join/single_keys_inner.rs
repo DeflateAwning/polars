@@ -1,7 +1,7 @@
 use polars_utils::iter::EnumerateIdxTrait;
 use polars_utils::sync::SyncPtr;
 
-use super::single_keys::create_probe_table;
+use super::single_keys::build_tables;
 use super::*;
 use crate::frame::hash_join::single_keys::probe_to_offsets;
 use crate::utils::flatten;
@@ -39,7 +39,8 @@ pub(super) fn hash_join_tuples_inner<T, IntoSlice>(
     build: Vec<IntoSlice>,
     // Because b should be the shorter relation we could need to swap to keep left left and right right.
     swap: bool,
-) -> (Vec<IdxSize>, Vec<IdxSize>)
+    validate: JoinValidation,
+) -> PolarsResult<(Vec<IdxSize>, Vec<IdxSize>)>
 where
     IntoSlice: AsRef<[T]> + Send + Sync,
     T: Send + Hash + Eq + Sync + Copy + AsU64,
@@ -47,14 +48,22 @@ where
     // NOTE: see the left join for more elaborate comments
 
     // first we hash one relation
-    let hash_tbls = create_probe_table(build);
+    let hash_tbls = if validate.needs_checks() {
+        let expected_size = build.iter().map(|v| v.as_ref().len()).sum();
+        let hash_tbls = build_tables(build);
+        let build_size = hash_tbls.iter().map(|m| m.len()).sum();
+        validate.validate_build(build_size, expected_size, !swap)?;
+        hash_tbls
+    } else {
+        build_tables(build)
+    };
 
     let n_tables = hash_tbls.len() as u64;
     debug_assert!(n_tables.is_power_of_two());
     let offsets = probe_to_offsets(&probe);
     // next we probe the other relation
     // code duplication is because we want to only do the swap check once
-    POOL.install(|| {
+    let out = POOL.install(|| {
         let tuples = probe
             .into_par_iter()
             .zip(offsets)
@@ -123,5 +132,6 @@ where
         }
 
         (left, right)
-    })
+    });
+    Ok(out)
 }

@@ -32,6 +32,10 @@ pub enum DataType {
     Duration(TimeUnit),
     /// A 64-bit time representing the elapsed time since midnight in nanoseconds
     Time,
+    /// A nested list with a fixed size in each row
+    #[cfg(feature = "dtype-array")]
+    Array(Box<DataType>, usize),
+    /// A nested list with a variable size in each row
     List(Box<DataType>),
     #[cfg(feature = "object")]
     /// A generic type that can be used in a `Series`
@@ -74,7 +78,11 @@ impl PartialEq for DataType {
                 #[cfg(feature = "object")]
                 (Object(lhs), Object(rhs)) => lhs == rhs,
                 #[cfg(feature = "dtype-struct")]
-                (Struct(lhs), Struct(rhs)) => lhs == rhs,
+                (Struct(lhs), Struct(rhs)) => Vec::as_ptr(lhs) == Vec::as_ptr(rhs) || lhs == rhs,
+                #[cfg(feature = "dtype-array")]
+                (Array(left_inner, left_width), Array(right_inner, right_width)) => {
+                    left_width == right_width && left_inner == right_inner
+                }
                 _ => std::mem::discriminant(self) == std::mem::discriminant(other),
             }
         }
@@ -103,10 +111,11 @@ impl DataType {
     }
 
     pub fn inner_dtype(&self) -> Option<&DataType> {
-        if let DataType::List(inner) = self {
-            Some(inner)
-        } else {
-            None
+        match self {
+            DataType::List(inner) => Some(inner),
+            #[cfg(feature = "dtype-array")]
+            DataType::Array(inner, _) => Some(inner),
+            _ => None,
         }
     }
 
@@ -151,7 +160,7 @@ impl DataType {
         self.is_numeric() | matches!(self, DataType::Boolean | DataType::Utf8 | DataType::Binary)
     }
 
-    /// Check if this [`DataType`] is a numeric type
+    /// Check if this [`DataType`] is a numeric type.
     pub fn is_numeric(&self) -> bool {
         // allow because it cannot be replaced when object feature is activated
         #[allow(clippy::match_like_matches_macro)]
@@ -172,6 +181,8 @@ impl DataType {
             DataType::Categorical(_) => false,
             #[cfg(feature = "dtype-struct")]
             DataType::Struct(_) => false,
+            #[cfg(feature = "dtype-decimal")]
+            DataType::Decimal(_, _) => false,
             _ => true,
         }
     }
@@ -228,6 +239,11 @@ impl DataType {
             Datetime(unit, tz) => ArrowDataType::Timestamp(unit.to_arrow(), tz.clone()),
             Duration(unit) => ArrowDataType::Duration(unit.to_arrow()),
             Time => ArrowDataType::Time64(ArrowTimeUnit::Nanosecond),
+            #[cfg(feature = "dtype-array")]
+            Array(dt, size) => ArrowDataType::FixedSizeList(
+                Box::new(arrow::datatypes::Field::new("item", dt.to_arrow(), true)),
+                *size,
+            ),
             List(dt) => ArrowDataType::LargeList(Box::new(arrow::datatypes::Field::new(
                 "item",
                 dt.to_arrow(),
@@ -291,7 +307,7 @@ impl Display for DataType {
                     (_, None) => f.write_str("decimal[?]"), // shouldn't happen
                     (None, Some(scale)) => f.write_str(&format!("decimal[{scale}]")),
                     (Some(precision), Some(scale)) => {
-                        f.write_str(&format!("decimal[.{precision},{scale}]"))
+                        f.write_str(&format!("decimal[{precision},{scale}]"))
                     }
                 };
             }
@@ -307,6 +323,8 @@ impl Display for DataType {
             }
             DataType::Duration(tu) => return write!(f, "duration[{tu}]"),
             DataType::Time => "time",
+            #[cfg(feature = "dtype-array")]
+            DataType::Array(tp, size) => return write!(f, "array[{tp}, {size}]"),
             DataType::List(tp) => return write!(f, "list[{tp}]"),
             #[cfg(feature = "object")]
             DataType::Object(s) => s,
@@ -314,7 +332,7 @@ impl Display for DataType {
             DataType::Categorical(_) => "cat",
             #[cfg(feature = "dtype-struct")]
             DataType::Struct(fields) => return write!(f, "struct[{}]", fields.len()),
-            DataType::Unknown => unreachable!(),
+            DataType::Unknown => "unknown",
         };
         f.write_str(s)
     }
@@ -326,12 +344,18 @@ pub fn merge_dtypes(left: &DataType, right: &DataType) -> PolarsResult<DataType>
     Ok(match (left, right) {
         #[cfg(feature = "dtype-categorical")]
         (Categorical(Some(rev_map_l)), Categorical(Some(rev_map_r))) => {
-            let rev_map = merge_categorical_map(rev_map_l, rev_map_r)?;
+            let rev_map = merge_rev_map(rev_map_l, rev_map_r)?;
             Categorical(Some(rev_map))
         }
         (List(inner_l), List(inner_r)) => {
             let merged = merge_dtypes(inner_l, inner_r)?;
             List(Box::new(merged))
+        }
+        #[cfg(feature = "dtype-array")]
+        (Array(inner_l, width_l), Array(inner_r, width_r)) => {
+            polars_ensure!(width_l == width_r, ComputeError: "widths of FixedSizeWidth Series are not equal");
+            let merged = merge_dtypes(inner_l, inner_r)?;
+            Array(Box::new(merged), *width_l)
         }
         (left, right) if left == right => left.clone(),
         _ => polars_bail!(ComputeError: "unable to merge datatypes"),

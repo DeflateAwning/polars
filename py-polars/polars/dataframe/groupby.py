@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Callable, Generic, Iterable, Iterator, TypeVar
+from typing import TYPE_CHECKING, Callable, Iterable, Iterator
 
 import polars._reexport as pl
 from polars import functions as F
@@ -8,6 +8,7 @@ from polars.functions.whenthen import WhenThen, WhenThenThen
 from polars.utils.convert import _timedelta_to_pl_duration
 
 if TYPE_CHECKING:
+    import sys
     from datetime import timedelta
 
     from polars import DataFrame
@@ -15,19 +16,22 @@ if TYPE_CHECKING:
         ClosedInterval,
         IntoExpr,
         RollingInterpolationMethod,
+        SchemaDict,
         StartBy,
     )
 
-# A type variable used to refer to a polars.DataFrame or any subclass of it
-DF = TypeVar("DF", bound="DataFrame")
+    if sys.version_info >= (3, 11):
+        from typing import Self
+    else:
+        from typing_extensions import Self
 
 
-class GroupBy(Generic[DF]):
+class GroupBy:
     """Starts a new GroupBy operation."""
 
     def __init__(
         self,
-        df: DF,
+        df: DataFrame,
         by: IntoExpr | Iterable[IntoExpr],
         *more_by: IntoExpr,
         maintain_order: bool,
@@ -56,7 +60,7 @@ class GroupBy(Generic[DF]):
         self.more_by = more_by
         self.maintain_order = maintain_order
 
-    def __iter__(self) -> GroupBy[DF]:
+    def __iter__(self) -> Self:
         """
         Allows iteration over the groups of the groupby operation.
 
@@ -119,7 +123,9 @@ class GroupBy(Generic[DF]):
 
         return self
 
-    def __next__(self) -> tuple[object, DF] | tuple[tuple[object, ...], DF]:
+    def __next__(
+        self,
+    ) -> tuple[object, DataFrame] | tuple[tuple[object, ...], DataFrame]:
         if self._current_index >= len(self._group_indices):
             raise StopIteration
 
@@ -131,27 +137,25 @@ class GroupBy(Generic[DF]):
 
     def agg(
         self,
-        aggs: IntoExpr | Iterable[IntoExpr] | None = None,
-        *more_aggs: IntoExpr,
+        *aggs: IntoExpr | Iterable[IntoExpr],
         **named_aggs: IntoExpr,
-    ) -> DF:
+    ) -> DataFrame:
         """
         Compute aggregations for each group of a groupby operation.
 
         Parameters
         ----------
-        aggs
-            Aggregations to compute for each group of the groupby operation.
+        *aggs
+            Aggregations to compute for each group of the groupby operation,
+            specified as positional arguments.
             Accepts expression input. Strings are parsed as column names.
-        *more_aggs
-            Additional aggregations, specified as positional arguments.
         **named_aggs
-            Additional aggregations, specified as keyword arguments. The resulting
-            columns will be renamed to the keyword used.
+            Additional aggregations, specified as keyword arguments.
+            The resulting columns will be renamed to the keyword used.
 
         Examples
         --------
-        Compute the sum of a column for each group.
+        Compute the aggregation of the columns for each group.
 
         >>> df = pl.DataFrame(
         ...     {
@@ -160,6 +164,22 @@ class GroupBy(Generic[DF]):
         ...         "c": [5, 4, 3, 2, 1],
         ...     }
         ... )
+        >>> df.groupby("a").agg([pl.col("b"), pl.col("c")])  # doctest: +IGNORE_RESULT
+        shape: (3, 3)
+        ┌─────┬───────────┬───────────┐
+        │ a   ┆ b         ┆ c         │
+        │ --- ┆ ---       ┆ ---       │
+        │ str ┆ list[i64] ┆ list[i64] │
+        ╞═════╪═══════════╪═══════════╡
+        │ a   ┆ [1, 1]    ┆ [5, 3]    │
+        ├╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┤
+        │ b   ┆ [2, 3]    ┆ [4, 2]    │
+        ├╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌┤
+        │ c   ┆ [3]       ┆ [1]       │
+        └─────┴───────────┴───────────┘
+
+        Compute the sum of a column for each group.
+
         >>> df.groupby("a").agg(pl.col("b").sum())  # doctest: +IGNORE_RESULT
         shape: (3, 2)
         ┌─────┬─────┐
@@ -221,17 +241,20 @@ class GroupBy(Generic[DF]):
         └─────┴───────┴────────────────┘
 
         """
-        df = (
+        return (
             self.df.lazy()
             .groupby(self.by, *self.more_by, maintain_order=self.maintain_order)
-            .agg(aggs, *more_aggs, **named_aggs)
+            .agg(*aggs, **named_aggs)
             .collect(no_optimization=True)
         )
-        return self.df.__class__._from_pydf(df._df)
 
-    def apply(self, function: Callable[[DataFrame], DataFrame]) -> DF:
+    def apply(self, function: Callable[[DataFrame], DataFrame]) -> DataFrame:
         """
         Apply a custom/user-defined function (UDF) over the groups as a sub-DataFrame.
+
+        .. warning::
+            This method is much slower than the native expressions API.
+            Only use it if you cannot implement your logic otherwise.
 
         Implementing logic using a Python function is almost always _significantly_
         slower and more memory intensive than implementing the same logic using
@@ -297,7 +320,7 @@ class GroupBy(Generic[DF]):
         It is better to implement this with an expression:
 
         >>> df.filter(
-        ...     pl.arange(0, pl.count()).shuffle().over("color") < 2
+        ...     pl.int_range(0, pl.count()).shuffle().over("color") < 2
         ... )  # doctest: +IGNORE_RESULT
 
         """
@@ -319,7 +342,7 @@ class GroupBy(Generic[DF]):
             self.df._df.groupby_apply(by, function, self.maintain_order)
         )
 
-    def head(self, n: int = 5) -> DF:
+    def head(self, n: int = 5) -> DataFrame:
         """
         Get the first `n` rows of each group.
 
@@ -365,15 +388,14 @@ class GroupBy(Generic[DF]):
         └─────────┴─────┘
 
         """
-        df = (
+        return (
             self.df.lazy()
             .groupby(self.by, *self.more_by, maintain_order=self.maintain_order)
             .head(n)
             .collect(no_optimization=True)
         )
-        return self.df.__class__._from_pydf(df._df)
 
-    def tail(self, n: int = 5) -> DF:
+    def tail(self, n: int = 5) -> DataFrame:
         """
         Get the last `n` rows of each group.
 
@@ -419,15 +441,14 @@ class GroupBy(Generic[DF]):
         └─────────┴─────┘
 
         """
-        df = (
+        return (
             self.df.lazy()
             .groupby(self.by, *self.more_by, maintain_order=self.maintain_order)
             .tail(n)
             .collect(no_optimization=True)
         )
-        return self.df.__class__._from_pydf(df._df)
 
-    def all(self) -> DF:
+    def all(self) -> DataFrame:
         """
         Aggregate the groups into Series.
 
@@ -448,9 +469,12 @@ class GroupBy(Generic[DF]):
         """
         return self.agg(F.all())
 
-    def count(self) -> DF:
+    def count(self) -> DataFrame:
         """
         Count the number of values in each group.
+
+        .. warning::
+            `null` is deemed a value in this context.
 
         Examples
         --------
@@ -477,7 +501,7 @@ class GroupBy(Generic[DF]):
         """
         return self.agg(F.count())
 
-    def first(self) -> DF:
+    def first(self) -> DataFrame:
         """
         Aggregate the first values in the group.
 
@@ -506,7 +530,7 @@ class GroupBy(Generic[DF]):
         """
         return self.agg(F.all().first())
 
-    def last(self) -> DF:
+    def last(self) -> DataFrame:
         """
         Aggregate the last values in the group.
 
@@ -535,7 +559,7 @@ class GroupBy(Generic[DF]):
         """
         return self.agg(F.all().last())
 
-    def max(self) -> DF:
+    def max(self) -> DataFrame:
         """
         Reduce the groups to the maximal value.
 
@@ -564,7 +588,7 @@ class GroupBy(Generic[DF]):
         """
         return self.agg(F.all().max())
 
-    def mean(self) -> DF:
+    def mean(self) -> DataFrame:
         """
         Reduce the groups to the mean values.
 
@@ -593,7 +617,7 @@ class GroupBy(Generic[DF]):
         """
         return self.agg(F.all().mean())
 
-    def median(self) -> DF:
+    def median(self) -> DataFrame:
         """
         Return the median per group.
 
@@ -620,7 +644,7 @@ class GroupBy(Generic[DF]):
         """
         return self.agg(F.all().median())
 
-    def min(self) -> DF:
+    def min(self) -> DataFrame:
         """
         Reduce the groups to the minimal value.
 
@@ -649,7 +673,7 @@ class GroupBy(Generic[DF]):
         """
         return self.agg(F.all().min())
 
-    def n_unique(self) -> DF:
+    def n_unique(self) -> DataFrame:
         """
         Count the unique values per group.
 
@@ -678,7 +702,7 @@ class GroupBy(Generic[DF]):
 
     def quantile(
         self, quantile: float, interpolation: RollingInterpolationMethod = "nearest"
-    ) -> DF:
+    ) -> DataFrame:
         """
         Compute the quantile per group.
 
@@ -713,7 +737,7 @@ class GroupBy(Generic[DF]):
         """
         return self.agg(F.all().quantile(quantile, interpolation=interpolation))
 
-    def sum(self) -> DF:
+    def sum(self) -> DataFrame:
         """
         Reduce the groups to the sum.
 
@@ -743,7 +767,7 @@ class GroupBy(Generic[DF]):
         return self.agg(F.all().sum())
 
 
-class RollingGroupBy(Generic[DF]):
+class RollingGroupBy:
     """
     A rolling grouper.
 
@@ -753,12 +777,13 @@ class RollingGroupBy(Generic[DF]):
 
     def __init__(
         self,
-        df: DF,
+        df: DataFrame,
         index_column: IntoExpr,
         period: str | timedelta,
         offset: str | timedelta | None,
         closed: ClosedInterval,
         by: IntoExpr | Iterable[IntoExpr] | None,
+        check_sorted: bool,
     ):
         period = _timedelta_to_pl_duration(period)
         offset = _timedelta_to_pl_duration(offset)
@@ -769,8 +794,9 @@ class RollingGroupBy(Generic[DF]):
         self.offset = offset
         self.closed = closed
         self.by = by
+        self.check_sorted = check_sorted
 
-    def __iter__(self) -> RollingGroupBy[DF]:
+    def __iter__(self) -> Self:
         temp_col = "__POLARS_GB_GROUP_INDICES"
         groups_df = (
             self.df.lazy()
@@ -781,6 +807,7 @@ class RollingGroupBy(Generic[DF]):
                 offset=self.offset,
                 closed=self.closed,
                 by=self.by,
+                check_sorted=self.check_sorted,
             )
             .agg(F.col(temp_col))
             .collect(no_optimization=True)
@@ -801,7 +828,9 @@ class RollingGroupBy(Generic[DF]):
 
         return self
 
-    def __next__(self) -> tuple[object, DF] | tuple[tuple[object, ...], DF]:
+    def __next__(
+        self,
+    ) -> tuple[object, DataFrame] | tuple[tuple[object, ...], DataFrame]:
         if self._current_index >= len(self._group_indices):
             raise StopIteration
 
@@ -813,11 +842,10 @@ class RollingGroupBy(Generic[DF]):
 
     def agg(
         self,
-        aggs: IntoExpr | Iterable[IntoExpr] | None = None,
-        *more_aggs: IntoExpr,
+        *aggs: IntoExpr | Iterable[IntoExpr],
         **named_aggs: IntoExpr,
-    ) -> DF:
-        df = (
+    ) -> DataFrame:
+        return (
             self.df.lazy()
             .groupby_rolling(
                 index_column=self.time_column,
@@ -825,14 +853,109 @@ class RollingGroupBy(Generic[DF]):
                 offset=self.offset,
                 closed=self.closed,
                 by=self.by,
+                check_sorted=self.check_sorted,
             )
-            .agg(aggs, *more_aggs, **named_aggs)
+            .agg(*aggs, **named_aggs)
             .collect(no_optimization=True)
         )
-        return self.df.__class__._from_pydf(df._df)
+
+    def apply(
+        self,
+        function: Callable[[DataFrame], DataFrame],
+        schema: SchemaDict | None,
+    ) -> DataFrame:
+        """
+        Apply a custom/user-defined function (UDF) over the groups as a new DataFrame.
+
+        Using this is considered an anti-pattern. This will be very slow because:
+
+        - it forces the engine to materialize the whole `DataFrames` for the groups.
+        - it is not parallelized
+        - it blocks optimizations as the passed python function is opaque to the
+          optimizer
+
+        The idiomatic way to apply custom functions over multiple columns is using:
+
+        `pl.struct([my_columns]).apply(lambda struct_series: ..)`
+
+        Parameters
+        ----------
+        function
+            Function to apply over each group of the `LazyFrame`.
+        schema
+            Schema of the output function. This has to be known statically. If the
+            given schema is incorrect, this is a bug in the caller's query and may
+            lead to errors. If set to None, polars assumes the schema is unchanged.
 
 
-class DynamicGroupBy(Generic[DF]):
+        Examples
+        --------
+        >>> df = pl.DataFrame(
+        ...     {
+        ...         "id": [0, 1, 2, 3, 4],
+        ...         "color": ["red", "green", "green", "red", "red"],
+        ...         "shape": ["square", "triangle", "square", "triangle", "square"],
+        ...     }
+        ... )
+        >>> df
+        shape: (5, 3)
+        ┌─────┬───────┬──────────┐
+        │ id  ┆ color ┆ shape    │
+        │ --- ┆ ---   ┆ ---      │
+        │ i64 ┆ str   ┆ str      │
+        ╞═════╪═══════╪══════════╡
+        │ 0   ┆ red   ┆ square   │
+        │ 1   ┆ green ┆ triangle │
+        │ 2   ┆ green ┆ square   │
+        │ 3   ┆ red   ┆ triangle │
+        │ 4   ┆ red   ┆ square   │
+        └─────┴───────┴──────────┘
+
+        For each color group sample two rows:
+
+        >>> (
+        ...     df.lazy()
+        ...     .groupby("color")
+        ...     .apply(lambda group_df: group_df.sample(2), schema=None)
+        ...     .collect()
+        ... )  # doctest: +IGNORE_RESULT
+        shape: (4, 3)
+        ┌─────┬───────┬──────────┐
+        │ id  ┆ color ┆ shape    │
+        │ --- ┆ ---   ┆ ---      │
+        │ i64 ┆ str   ┆ str      │
+        ╞═════╪═══════╪══════════╡
+        │ 1   ┆ green ┆ triangle │
+        │ 2   ┆ green ┆ square   │
+        │ 4   ┆ red   ┆ square   │
+        │ 3   ┆ red   ┆ triangle │
+        └─────┴───────┴──────────┘
+
+        It is better to implement this with an expression:
+
+        >>> (
+        ...     df.lazy()
+        ...     .filter(pl.int_range(0, pl.count()).shuffle().over("color") < 2)
+        ...     .collect()
+        ... )  # doctest: +IGNORE_RESULT
+
+        """
+        return (
+            self.df.lazy()
+            .groupby_rolling(
+                index_column=self.time_column,
+                period=self.period,
+                offset=self.offset,
+                closed=self.closed,
+                by=self.by,
+                check_sorted=self.check_sorted,
+            )
+            .apply(function, schema)
+            .collect(no_optimization=True)
+        )
+
+
+class DynamicGroupBy:
     """
     A dynamic grouper.
 
@@ -842,7 +965,7 @@ class DynamicGroupBy(Generic[DF]):
 
     def __init__(
         self,
-        df: DF,
+        df: DataFrame,
         index_column: IntoExpr,
         every: str | timedelta,
         period: str | timedelta | None,
@@ -852,10 +975,11 @@ class DynamicGroupBy(Generic[DF]):
         closed: ClosedInterval,
         by: IntoExpr | Iterable[IntoExpr] | None,
         start_by: StartBy,
+        check_sorted: bool,
     ):
+        every = _timedelta_to_pl_duration(every)
         period = _timedelta_to_pl_duration(period)
         offset = _timedelta_to_pl_duration(offset)
-        every = _timedelta_to_pl_duration(every)
 
         self.df = df
         self.time_column = index_column
@@ -867,8 +991,9 @@ class DynamicGroupBy(Generic[DF]):
         self.closed = closed
         self.by = by
         self.start_by = start_by
+        self.check_sorted = check_sorted
 
-    def __iter__(self) -> DynamicGroupBy[DF]:
+    def __iter__(self) -> Self:
         temp_col = "__POLARS_GB_GROUP_INDICES"
         groups_df = (
             self.df.lazy()
@@ -883,6 +1008,7 @@ class DynamicGroupBy(Generic[DF]):
                 closed=self.closed,
                 by=self.by,
                 start_by=self.start_by,
+                check_sorted=self.check_sorted,
             )
             .agg(F.col(temp_col))
             .collect(no_optimization=True)
@@ -903,7 +1029,9 @@ class DynamicGroupBy(Generic[DF]):
 
         return self
 
-    def __next__(self) -> tuple[object, DF] | tuple[tuple[object, ...], DF]:
+    def __next__(
+        self,
+    ) -> tuple[object, DataFrame] | tuple[tuple[object, ...], DataFrame]:
         if self._current_index >= len(self._group_indices):
             raise StopIteration
 
@@ -915,11 +1043,10 @@ class DynamicGroupBy(Generic[DF]):
 
     def agg(
         self,
-        aggs: IntoExpr | Iterable[IntoExpr] | None = None,
-        *more_aggs: IntoExpr,
+        *aggs: IntoExpr | Iterable[IntoExpr],
         **named_aggs: IntoExpr,
-    ) -> DF:
-        df = (
+    ) -> DataFrame:
+        return (
             self.df.lazy()
             .groupby_dynamic(
                 index_column=self.time_column,
@@ -931,8 +1058,107 @@ class DynamicGroupBy(Generic[DF]):
                 closed=self.closed,
                 by=self.by,
                 start_by=self.start_by,
+                check_sorted=self.check_sorted,
             )
-            .agg(aggs, *more_aggs, **named_aggs)
+            .agg(*aggs, **named_aggs)
             .collect(no_optimization=True)
         )
-        return self.df.__class__._from_pydf(df._df)
+
+    def apply(
+        self,
+        function: Callable[[DataFrame], DataFrame],
+        schema: SchemaDict | None,
+    ) -> DataFrame:
+        """
+        Apply a custom/user-defined function (UDF) over the groups as a new DataFrame.
+
+        Using this is considered an anti-pattern. This will be very slow because:
+
+        - it forces the engine to materialize the whole `DataFrames` for the groups.
+        - it is not parallelized
+        - it blocks optimizations as the passed python function is opaque to the
+          optimizer
+
+        The idiomatic way to apply custom functions over multiple columns is using:
+
+        `pl.struct([my_columns]).apply(lambda struct_series: ..)`
+
+        Parameters
+        ----------
+        function
+            Function to apply over each group of the `LazyFrame`.
+        schema
+            Schema of the output function. This has to be known statically. If the
+            given schema is incorrect, this is a bug in the caller's query and may
+            lead to errors. If set to None, polars assumes the schema is unchanged.
+
+
+        Examples
+        --------
+        >>> df = pl.DataFrame(
+        ...     {
+        ...         "id": [0, 1, 2, 3, 4],
+        ...         "color": ["red", "green", "green", "red", "red"],
+        ...         "shape": ["square", "triangle", "square", "triangle", "square"],
+        ...     }
+        ... )
+        >>> df
+        shape: (5, 3)
+        ┌─────┬───────┬──────────┐
+        │ id  ┆ color ┆ shape    │
+        │ --- ┆ ---   ┆ ---      │
+        │ i64 ┆ str   ┆ str      │
+        ╞═════╪═══════╪══════════╡
+        │ 0   ┆ red   ┆ square   │
+        │ 1   ┆ green ┆ triangle │
+        │ 2   ┆ green ┆ square   │
+        │ 3   ┆ red   ┆ triangle │
+        │ 4   ┆ red   ┆ square   │
+        └─────┴───────┴──────────┘
+
+        For each color group sample two rows:
+
+        >>> (
+        ...     df.lazy()
+        ...     .groupby("color")
+        ...     .apply(lambda group_df: group_df.sample(2), schema=None)
+        ...     .collect()
+        ... )  # doctest: +IGNORE_RESULT
+        shape: (4, 3)
+        ┌─────┬───────┬──────────┐
+        │ id  ┆ color ┆ shape    │
+        │ --- ┆ ---   ┆ ---      │
+        │ i64 ┆ str   ┆ str      │
+        ╞═════╪═══════╪══════════╡
+        │ 1   ┆ green ┆ triangle │
+        │ 2   ┆ green ┆ square   │
+        │ 4   ┆ red   ┆ square   │
+        │ 3   ┆ red   ┆ triangle │
+        └─────┴───────┴──────────┘
+
+        It is better to implement this with an expression:
+
+        >>> (
+        ...     df.lazy()
+        ...     .filter(pl.int_range(0, pl.count()).shuffle().over("color") < 2)
+        ...     .collect()
+        ... )  # doctest: +IGNORE_RESULT
+
+        """
+        return (
+            self.df.lazy()
+            .groupby_dynamic(
+                index_column=self.time_column,
+                every=self.every,
+                period=self.period,
+                offset=self.offset,
+                truncate=self.truncate,
+                include_boundaries=self.include_boundaries,
+                closed=self.closed,
+                by=self.by,
+                start_by=self.start_by,
+                check_sorted=self.check_sorted,
+            )
+            .apply(function, schema)
+            .collect(no_optimization=True)
+        )

@@ -43,6 +43,7 @@ fn test_special_groupby_schemas() -> PolarsResult<()> {
     let out = df
         .clone()
         .lazy()
+        .with_column(col("a").set_sorted_flag(IsSorted::Ascending))
         .groupby_rolling(
             col("a"),
             [],
@@ -67,6 +68,7 @@ fn test_special_groupby_schemas() -> PolarsResult<()> {
 
     let out = df
         .lazy()
+        .with_column(col("a").set_sorted_flag(IsSorted::Ascending))
         .groupby_dynamic(
             col("a"),
             [],
@@ -165,7 +167,7 @@ fn test_sorted_path_joins() -> PolarsResult<()> {
     let out = dfa
         .lazy()
         .with_column(col("a").set_sorted_flag(IsSorted::Ascending))
-        .join(dfb.lazy(), [col("a")], [col("a")], JoinType::Left)
+        .join(dfb.lazy(), [col("a")], [col("a")], JoinType::Left.into())
         .collect()?;
 
     let s = out.column("a")?;
@@ -237,8 +239,8 @@ fn test_groupby_on_lists() -> PolarsResult<()> {
 
     let mut builder =
         ListPrimitiveChunkedBuilder::<Int32Type>::new("arrays", 10, 10, DataType::Int32);
-    builder.append_series(&s0);
-    builder.append_series(&s1);
+    builder.append_series(&s0).unwrap();
+    builder.append_series(&s1).unwrap();
     let s2 = builder.finish().into_series();
 
     let df = DataFrame::new(vec![s1, s2])?;
@@ -255,7 +257,6 @@ fn test_groupby_on_lists() -> PolarsResult<()> {
     );
 
     let out = df
-        .clone()
         .lazy()
         .groupby([col("groups")])
         .agg([col("arrays").implode()])

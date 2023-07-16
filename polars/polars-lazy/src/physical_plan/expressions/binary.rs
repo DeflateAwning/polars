@@ -56,6 +56,8 @@ pub fn apply_operator(left: &Series, right: &Series, op: Operator) -> PolarsResu
         Operator::Multiply => Ok(left * right),
         Operator::Divide => Ok(left / right),
         Operator::TrueDivide => match left.dtype() {
+            #[cfg(feature = "dtype-decimal")]
+            Decimal(_, _) => Ok(left / right),
             Date | Datetime(_, _) | Float32 | Float64 => Ok(left / right),
             _ => Ok(&left.cast(&Float64)? / &right.cast(&Float64)?),
         },
@@ -73,6 +75,8 @@ pub fn apply_operator(left: &Series, right: &Series, op: Operator) -> PolarsResu
         Operator::Or => left.bitor(right),
         Operator::Xor => left.bitxor(right),
         Operator::Modulus => Ok(left % right),
+        Operator::EqValidity => left.equal_missing(right).map(|ca| ca.into_series()),
+        Operator::NotEqValidity => left.not_equal_missing(right).map(|ca| ca.into_series()),
     }
 }
 
@@ -151,12 +155,27 @@ impl PhysicalExpr for BinaryExpr {
         // window functions may set a global state that determine their output
         // state, so we don't let them run in parallel as they race
         // they also saturate the thread pool by themselves, so that's fine
-        let (lhs, rhs) = if state.has_window() {
+        let has_window = state.has_window();
+        // streaming takes care of parallelism, don't parallelize here, as it
+        // increases contention
+
+        #[cfg(feature = "streaming")]
+        let in_streaming = state.in_streaming_engine();
+
+        #[cfg(not(feature = "streaming"))]
+        let in_streaming = false;
+
+        let (lhs, rhs) = if has_window {
             let mut state = state.split();
             state.remove_cache_window_flag();
             (
                 self.left.evaluate(df, &state),
                 self.right.evaluate(df, &state),
+            )
+        } else if in_streaming {
+            (
+                self.left.evaluate(df, state),
+                self.right.evaluate(df, state),
             )
         } else {
             POOL.install(|| {

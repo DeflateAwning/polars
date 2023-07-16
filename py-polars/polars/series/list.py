@@ -17,12 +17,64 @@ if TYPE_CHECKING:
 
 @expr_dispatch
 class ListNameSpace:
-    """Series.arr namespace."""
+    """Namespace for list related methods."""
 
-    _accessor = "arr"
+    _accessor = "list"
 
     def __init__(self, series: Series):
         self._s: PySeries = series._s
+
+    def all(self) -> Expr:
+        """
+        Evaluate whether all boolean values in a list are true.
+
+        Examples
+        --------
+        >>> df = pl.DataFrame(
+        ...     {"a": [[True, True], [False, True], [False, False], [None], [], None]}
+        ... )
+        >>> df.select(pl.col("a").list.all())
+        shape: (6, 1)
+        ┌───────┐
+        │ a     │
+        │ ---   │
+        │ bool  │
+        ╞═══════╡
+        │ true  │
+        │ false │
+        │ false │
+        │ false │
+        │ true  │
+        │ null  │
+        └───────┘
+
+        """
+
+    def any(self) -> Expr:
+        """
+        Evaluate whether any boolean value in a list is true.
+
+        Examples
+        --------
+        >>> df = pl.DataFrame(
+        ...     {"a": [[True, True], [False, True], [False, False], [None], [], None]}
+        ... )
+        >>> df.select(pl.col("a").list.any())
+        shape: (6, 1)
+        ┌───────┐
+        │ a     │
+        │ ---   │
+        │ bool  │
+        ╞═══════╡
+        │ true  │
+        │ true  │
+        │ false │
+        │ false │
+        │ false │
+        │ null  │
+        └───────┘
+
+        """
 
     def lengths(self) -> Series:
         """
@@ -31,7 +83,7 @@ class ListNameSpace:
         Examples
         --------
         >>> s = pl.Series([[1, 2, 3], [5]])
-        >>> s.arr.lengths()
+        >>> s.list.lengths()
         shape: (2,)
         Series: '' [u32]
         [
@@ -65,14 +117,14 @@ class ListNameSpace:
         Examples
         --------
         >>> s = pl.Series("a", [[3, 2, 1], [9, 1, 2]])
-        >>> s.arr.sort()
+        >>> s.list.sort()
         shape: (2,)
         Series: 'a' [list[i64]]
         [
                 [1, 2, 3]
                 [1, 2, 9]
         ]
-        >>> s.arr.sort(descending=True)
+        >>> s.list.sort(descending=True)
         shape: (2,)
         Series: 'a' [list[i64]]
         [
@@ -164,7 +216,7 @@ class ListNameSpace:
         Examples
         --------
         >>> s = pl.Series([["foo", "bar"], ["hello", "world"]])
-        >>> s.arr.join(separator="-")
+        >>> s.list.join(separator="-")
         shape: (2,)
         Series: '' [str]
         [
@@ -229,7 +281,7 @@ class ListNameSpace:
         Examples
         --------
         >>> s = pl.Series("a", [[1, 2, 3, 4], [10, 2, 1]])
-        >>> s.arr.diff()
+        >>> s.list.diff()
         shape: (2,)
         Series: 'a' [list[i64]]
         [
@@ -237,7 +289,7 @@ class ListNameSpace:
             [null, -8, -1]
         ]
 
-        >>> s.arr.diff(n=2)
+        >>> s.list.diff(n=2)
         shape: (2,)
         Series: 'a' [list[i64]]
         [
@@ -245,7 +297,7 @@ class ListNameSpace:
             [null, null, -9]
         ]
 
-        >>> s.arr.diff(n=2, null_behavior="drop")
+        >>> s.list.diff(n=2, null_behavior="drop")
         shape: (2,)
         Series: 'a' [list[i64]]
         [
@@ -267,7 +319,7 @@ class ListNameSpace:
         Examples
         --------
         >>> s = pl.Series("a", [[1, 2, 3, 4], [10, 2, 1]])
-        >>> s.arr.shift()
+        >>> s.list.shift()
         shape: (2,)
         Series: 'a' [list[i64]]
         [
@@ -277,7 +329,7 @@ class ListNameSpace:
 
         """
 
-    def slice(self, offset: int, length: int | None = None) -> Series:
+    def slice(self, offset: int | Expr, length: int | Expr | None = None) -> Series:
         """
         Slice every sublist.
 
@@ -292,7 +344,7 @@ class ListNameSpace:
         Examples
         --------
         >>> s = pl.Series("a", [[1, 2, 3, 4], [10, 2, 1]])
-        >>> s.arr.slice(1, 2)
+        >>> s.list.slice(1, 2)
         shape: (2,)
         Series: 'a' [list[i64]]
         [
@@ -302,7 +354,7 @@ class ListNameSpace:
 
         """
 
-    def head(self, n: int = 5) -> Series:
+    def head(self, n: int | Expr = 5) -> Series:
         """
         Slice the first `n` values of every sublist.
 
@@ -314,7 +366,7 @@ class ListNameSpace:
         Examples
         --------
         >>> s = pl.Series("a", [[1, 2, 3, 4], [10, 2, 1]])
-        >>> s.arr.head(2)
+        >>> s.list.head(2)
         shape: (2,)
         Series: 'a' [list[i64]]
         [
@@ -324,7 +376,7 @@ class ListNameSpace:
 
         """
 
-    def tail(self, n: int = 5) -> Series:
+    def tail(self, n: int | Expr = 5) -> Series:
         """
         Slice the last `n` values of every sublist.
 
@@ -336,7 +388,7 @@ class ListNameSpace:
         Examples
         --------
         >>> s = pl.Series("a", [[1, 2, 3, 4], [10, 2, 1]])
-        >>> s.arr.tail(2)
+        >>> s.list.tail(2)
         shape: (2,)
         Series: 'a' [list[i64]]
         [
@@ -361,7 +413,7 @@ class ListNameSpace:
         Examples
         --------
         >>> s = pl.Series("a", [[1, 2, 3], [4, 5, 6]])
-        >>> s.arr.explode()
+        >>> s.list.explode()
         shape: (6,)
         Series: 'a' [i64]
         [
@@ -417,7 +469,7 @@ class ListNameSpace:
         Convert list to struct with default field name assignment:
 
         >>> s1 = pl.Series("n", [[0, 1, 2], [0, 1]])
-        >>> s2 = s1.arr.to_struct()
+        >>> s2 = s1.list.to_struct()
         >>> s2
         shape: (2,)
         Series: 'n' [struct[3]]
@@ -430,13 +482,13 @@ class ListNameSpace:
 
         Convert list to struct with field name assignment by function/index:
 
-        >>> s3 = s1.arr.to_struct(fields=lambda idx: f"n{idx:02}")
+        >>> s3 = s1.list.to_struct(fields=lambda idx: f"n{idx:02}")
         >>> s3.struct.fields
         ['n00', 'n01', 'n02']
 
         Convert list to struct with field name assignment by index from a list of names:
 
-        >>> s1.arr.to_struct(fields=["one", "two", "three"]).struct.unnest()
+        >>> s1.list.to_struct(fields=["one", "two", "three"]).struct.unnest()
         shape: (2, 3)
         ┌─────┬─────┬───────┐
         │ one ┆ two ┆ three │
@@ -452,7 +504,7 @@ class ListNameSpace:
         return (
             s.to_frame()
             .select(
-                F.col(s.name).arr.to_struct(
+                F.col(s.name).list.to_struct(
                     # note: in eager mode, 'upper_bound' is always zero, as (unlike
                     # in lazy mode) there is no need to determine/track the schema.
                     n_field_strategy,
@@ -483,7 +535,7 @@ class ListNameSpace:
         --------
         >>> df = pl.DataFrame({"a": [1, 8, 3], "b": [4, 5, 2]})
         >>> df.with_columns(
-        ...     pl.concat_list(["a", "b"]).arr.eval(pl.element().rank()).alias("rank")
+        ...     pl.concat_list(["a", "b"]).list.eval(pl.element().rank()).alias("rank")
         ... )
         shape: (3, 3)
         ┌─────┬─────┬────────────┐
@@ -497,3 +549,93 @@ class ListNameSpace:
         └─────┴─────┴────────────┘
 
         """
+
+    def union(self, other: Series) -> Series:
+        """
+        Compute the SET UNION between the elements in this list and the elements of ``other``.
+
+        Parameters
+        ----------
+        other
+            Right hand side of the set operation.
+
+        Examples
+        --------
+        >>> a = pl.Series([[1, 2, 3], [], [None, 3], [5, 6, 7]])
+        >>> b = pl.Series([[2, 3, 4], [3], [3, 4, None], [6, 8]])
+        >>> a.list.union(b)  # doctest: +IGNORE_RESULT
+        shape: (4,)
+        Series: '' [list[i64]]
+        [
+                [1, 2, 3, 4]
+                [3]
+                [null, 3, 4]
+                [5, 6, 7, 8]
+        ]
+
+        """  # noqa: W505.
+
+    def difference(self, other: Series) -> Series:
+        """
+        Compute the SET DIFFERENCE between the elements in this list and the elements of ``other``.
+
+        Parameters
+        ----------
+        other
+            Right hand side of the set operation.
+
+        Examples
+        --------
+        >>> a = pl.Series([[1, 2, 3], [], [None, 3], [5, 6, 7]])
+        >>> b = pl.Series([[2, 3, 4], [3], [3, 4, None], [6, 8]])
+        >>> a.list.difference(b)
+        shape: (4,)
+        Series: '' [list[i64]]
+        [
+                [1]
+                []
+                []
+                [5, 7]
+        ]
+
+        See Also
+        --------
+        polars.Series.list.diff: Calculates the n-th discrete difference of every sublist.
+
+        """  # noqa: W505.
+
+    def intersection(self, other: Series) -> Series:
+        """
+        Compute the SET INTERSECTION between the elements in this list and the elements of ``other``.
+
+        Parameters
+        ----------
+        other
+            Right hand side of the set operation.
+
+        Examples
+        --------
+        >>> a = pl.Series([[1, 2, 3], [], [None, 3], [5, 6, 7]])
+        >>> b = pl.Series([[2, 3, 4], [3], [3, 4, None], [6, 8]])
+        >>> a.list.intersection(b)
+        shape: (4,)
+        Series: '' [list[i64]]
+        [
+                [2, 3]
+                []
+                [null, 3]
+                [6]
+        ]
+
+        """  # noqa: W505.
+
+    def symmetric_difference(self, other: Series) -> Series:
+        """
+        Compute the SET SYMMETRIC DIFFERENCE between the elements in this list and the elements of ``other``.
+
+        Parameters
+        ----------
+        other
+            Right hand side of the set operation.
+
+        """  # noqa: W505.

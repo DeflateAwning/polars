@@ -3,6 +3,8 @@ use polars_core::frame::explode::MeltArgs;
 use polars_core::series::ops::NullBehavior;
 
 use super::*;
+#[cfg(feature = "range")]
+use crate::dsl::arg_sort_by;
 
 #[test]
 fn test_lazy_with_column() {
@@ -266,7 +268,7 @@ fn test_lazy_query_4() {
             base_df,
             [col("uid"), col("day")],
             [col("uid"), col("day")],
-            JoinType::Inner,
+            JoinType::Inner.into(),
         )
         .collect()
         .unwrap();
@@ -366,7 +368,7 @@ fn test_lazy_query_9() -> PolarsResult<()> {
             cities.lazy(),
             [col("Sales.City")],
             [col("Cities.City")],
-            JoinType::Inner,
+            JoinType::Inner.into(),
         )
         .groupby([col("Cities.Country")])
         .agg([col("Sales.Amount").sum().alias("sum")])
@@ -627,7 +629,7 @@ fn test_type_coercion() {
     lp_top = optimizer
         .optimize_loop(rules, &mut expr_arena, &mut lp_arena, lp_top)
         .unwrap();
-    let lp = node_to_lp(lp_top, &mut expr_arena, &mut lp_arena);
+    let lp = node_to_lp(lp_top, &expr_arena, &mut lp_arena);
 
     if let LogicalPlan::Projection { expr, .. } = lp {
         if let Expr::BinaryExpr { left, right, .. } = &expr[0] {
@@ -775,7 +777,7 @@ fn test_lazy_groupby_sort() {
         .agg([col("b").sort(false).first()])
         .collect()
         .unwrap()
-        .sort(["a"], false)
+        .sort(["a"], false, false)
         .unwrap();
 
     assert_eq!(
@@ -789,7 +791,7 @@ fn test_lazy_groupby_sort() {
         .agg([col("b").sort(false).last()])
         .collect()
         .unwrap()
-        .sort(["a"], false)
+        .sort(["a"], false, false)
         .unwrap();
 
     assert_eq!(
@@ -813,7 +815,7 @@ fn test_lazy_groupby_sort_by() {
         .agg([col("b").sort_by([col("c")], [true]).first()])
         .collect()
         .unwrap()
-        .sort(["a"], false)
+        .sort(["a"], false, false)
         .unwrap();
 
     assert_eq!(
@@ -898,13 +900,14 @@ fn test_lazy_groupby_filter() -> PolarsResult<()> {
                 descending: false,
                 nulls_last: false,
                 multithreaded: true,
+                maintain_order: false,
             },
         )
         .collect()?;
 
     assert_eq!(
         Vec::from(out.column("b_sum").unwrap().i32().unwrap()),
-        [Some(6), None, None]
+        [Some(6), Some(0), Some(0)]
     );
     assert_eq!(
         Vec::from(out.column("b_first").unwrap().i32().unwrap()),
@@ -1015,6 +1018,7 @@ fn test_groupby_cumsum() -> PolarsResult<()> {
 }
 
 #[test]
+#[cfg(feature = "range")]
 fn test_arg_sort_multiple() -> PolarsResult<()> {
     let df = df![
         "int" => [1, 2, 3, 1, 2],
@@ -1128,7 +1132,12 @@ fn test_fill_forward() -> PolarsResult<()> {
 
     let out = df
         .lazy()
-        .select([col("b").forward_fill(None).implode().over([col("a")])])
+        .select([col("b").forward_fill(None).over_with_options(
+            [col("a")],
+            WindowOptions {
+                mapping: WindowMapping::Join,
+            },
+        )])
         .collect()?;
     let agg = out.column("b")?.list()?;
 
@@ -1288,8 +1297,12 @@ fn test_filter_after_shift_in_groups() -> PolarsResult<()> {
             col("B")
                 .shift(1)
                 .filter(col("B").shift(1).gt(lit(4)))
-                .implode()
-                .over([col("fruits")])
+                .over_with_options(
+                    [col("fruits")],
+                    WindowOptions {
+                        mapping: WindowMapping::Join,
+                    },
+                )
                 .alias("filtered"),
         ])
         .collect()?;
@@ -1375,7 +1388,7 @@ fn test_filter_count() -> PolarsResult<()> {
             .filter(col("fruits").eq(lit("banana")))
             .count()])
         .collect()?;
-    assert_eq!(out.column("fruits")?.u32()?.get(0), Some(3));
+    assert_eq!(out.column("fruits")?.idx()?.get(0), Some(3));
     Ok(())
 }
 
@@ -1433,34 +1446,10 @@ fn test_singleton_broadcast() -> PolarsResult<()> {
 }
 
 #[test]
-fn test_sort_by_suffix() -> PolarsResult<()> {
-    let df = fruits_cars();
-    let out = df
-        .lazy()
-        .select([col("*")
-            .sort_by([col("A")], [false])
-            .implode()
-            .over([col("fruits")])
-            .flatten()
-            .suffix("_sorted")])
-        .collect()?;
-
-    let expected = df!(
-            "A_sorted"=> [1, 2, 5, 3, 4],
-            "fruits_sorted"=> ["banana", "banana", "banana", "apple", "apple"],
-            "B_sorted"=> [5, 4, 1, 3, 2],
-            "cars_sorted"=> ["beetle", "audi", "beetle", "beetle", "beetle"]
-    )?;
-
-    assert!(expected.frame_equal(&out));
-    Ok(())
-}
-
-#[test]
 fn test_list_in_select_context() -> PolarsResult<()> {
     let s = Series::new("a", &[1, 2, 3]);
     let mut builder = get_list_builder(s.dtype(), s.len(), 1, s.name()).unwrap();
-    builder.append_series(&s);
+    builder.append_series(&s).unwrap();
     let expected = builder.finish().into_series();
 
     let df = DataFrame::new(vec![s])?;
@@ -1612,14 +1601,11 @@ fn test_binary_expr() -> PolarsResult<()> {
             "random"=> [0.1f64, 0.6, 0.2, 0.6, 0.3]
     )?;
 
-    let out = df
-        .lazy()
-        .select([when(col("random").gt(lit(0.5)))
-            .then(lit(2))
-            .otherwise(col("random"))
-            .alias("other")
-            * col("nrs").sum()])
-        .collect()?;
+    let other = when(col("random").gt(lit(0.5)))
+        .then(lit(2))
+        .otherwise(col("random"))
+        .alias("other");
+    let out = df.lazy().select([other * col("nrs").sum()]).collect()?;
     assert_eq!(out.dtypes(), &[DataType::Float64]);
     Ok(())
 }
@@ -1639,10 +1625,9 @@ fn test_single_group_result() -> PolarsResult<()> {
                 descending: false,
                 nulls_last: false,
                 multithreaded: true,
+                maintain_order: false,
             })
-            .implode()
-            .over([col("a")])
-            .flatten()])
+            .over([col("a")])])
         .collect()?;
 
     let a = out.column("a")?.idx()?;
@@ -1669,8 +1654,12 @@ fn test_single_ranked_group() -> PolarsResult<()> {
                 },
                 None,
             )
-            .implode()
-            .over([col("group")])])
+            .over_with_options(
+                [col("group")],
+                WindowOptions {
+                    mapping: WindowMapping::Join,
+                },
+            )])
         .collect()?;
 
     let out = out.column("value")?.explode()?;
@@ -1866,7 +1855,7 @@ fn test_partitioned_gb_binary() -> PolarsResult<()> {
 
     assert!(out.frame_equal(&df![
         "col" => [0],
-        "sum" => [200.0 as f32],
+        "sum" => [200.0_f32],
     ]?));
 
     Ok(())
@@ -1877,11 +1866,10 @@ fn test_partitioned_gb_ternary() -> PolarsResult<()> {
     // don't move these to integration tests
     let df = df![
         "col" => (0..20).map(|_| Some(0)).collect::<Int32Chunked>().into_series(),
-        "val" => (0..20).map(|i| Some(i)).collect::<Int32Chunked>().into_series(),
+        "val" => (0..20).map(Some).collect::<Int32Chunked>().into_series(),
     ]?;
 
     let out = df
-        .clone()
         .lazy()
         .groupby([col("col")])
         .agg([when(col("val").gt(lit(10)))
@@ -1896,5 +1884,25 @@ fn test_partitioned_gb_ternary() -> PolarsResult<()> {
         "sum" => [9],
     ]?));
 
+    Ok(())
+}
+
+#[test]
+fn test_sort_maintain_order_true() -> PolarsResult<()> {
+    let q = df![
+        "A" => [1, 1, 1, 1],
+        "B" => ["A", "B", "C", "D"],
+    ]?
+    .lazy();
+
+    let res = q
+        .sort_by_exprs([col("A")], [false], false, true)
+        .slice(0, 3)
+        .collect()?;
+    println!("{:?}", res);
+    assert!(res.frame_equal(&df![
+        "A" => [1, 1, 1],
+        "B" => ["A", "B", "C"],
+    ]?));
     Ok(())
 }

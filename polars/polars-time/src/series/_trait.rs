@@ -15,8 +15,9 @@ macro_rules! invalid_operation {
 pub trait SeriesOpsTime {
     fn ops_time_dtype(&self) -> &DataType;
 
-    /// Apply a rolling mean to a Series. See:
-    /// [ChunkedArray::rolling_mean](crate::prelude::ChunkWindow::rolling_mean).
+    /// Apply a rolling mean to a Series.
+    ///
+    /// See: [`RollingAgg::rolling_mean`]
     #[cfg(feature = "rolling_window")]
     fn rolling_mean(&self, _options: RollingOptionsImpl) -> PolarsResult<Series> {
         invalid_operation!(self)
@@ -33,12 +34,7 @@ pub trait SeriesOpsTime {
     }
     /// Apply a rolling quantile to a Series.
     #[cfg(feature = "rolling_window")]
-    fn rolling_quantile(
-        &self,
-        _quantile: f64,
-        _interpolation: QuantileInterpolOptions,
-        _options: RollingOptionsImpl,
-    ) -> PolarsResult<Series> {
+    fn rolling_quantile(&self, _options: RollingOptionsImpl) -> PolarsResult<Series> {
         invalid_operation!(self)
     }
 
@@ -84,16 +80,9 @@ impl SeriesOpsTime for Series {
     }
     /// Apply a rolling quantile to a Series.
     #[cfg(feature = "rolling_window")]
-    fn rolling_quantile(
-        &self,
-        quantile: f64,
-        interpolation: QuantileInterpolOptions,
-        options: RollingOptionsImpl,
-    ) -> PolarsResult<Series> {
-        self.to_ops()
-            .rolling_quantile(quantile, interpolation, options)
+    fn rolling_quantile(&self, options: RollingOptionsImpl) -> PolarsResult<Series> {
+        self.to_ops().rolling_quantile(options)
     }
-
     #[cfg(feature = "rolling_window")]
     fn rolling_min(&self, options: RollingOptionsImpl) -> PolarsResult<Series> {
         self.to_ops().rolling_min(options)

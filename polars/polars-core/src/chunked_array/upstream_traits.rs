@@ -1,4 +1,4 @@
-//! Implementations of upstream traits for ChunkedArray<T>
+//! Implementations of upstream traits for [`ChunkedArray<T>`]
 use std::borrow::{Borrow, Cow};
 use std::collections::LinkedList;
 use std::iter::FromIterator;
@@ -14,6 +14,8 @@ use rayon::prelude::*;
 use crate::chunked_array::builder::{
     get_list_builder, AnonymousListBuilder, AnonymousOwnedListBuilder,
 };
+#[cfg(feature = "dtype-array")]
+use crate::chunked_array::builder::{AnonymousOwnedFixedSizeListBuilder, FixedSizeListBuilder};
 #[cfg(feature = "object")]
 use crate::chunked_array::object::ObjectArray;
 use crate::prelude::*;
@@ -115,7 +117,7 @@ where
     }
 }
 
-/// Local AsRef<T> trait to circumvent the orphan rule.
+/// Local [`AsRef<T>`] trait to circumvent the orphan rule.
 pub trait PolarsAsRef<T: ?Sized>: AsRef<T> {}
 
 impl PolarsAsRef<str> for String {}
@@ -181,9 +183,9 @@ where
         let mut builder =
             get_list_builder(v.borrow().dtype(), capacity * 5, capacity, "collected").unwrap();
 
-        builder.append_series(v.borrow());
+        builder.append_series(v.borrow()).unwrap();
         for s in it {
-            builder.append_series(s.borrow());
+            builder.append_series(s.borrow()).unwrap();
         }
         builder.finish()
     }
@@ -229,7 +231,7 @@ impl FromIterator<Option<Series>> for ListChunked {
                     builder.append_empty();
 
                     for opt_s in it {
-                        builder.append_opt_series(opt_s.as_ref());
+                        builder.append_opt_series(opt_s.as_ref()).unwrap();
                     }
                     builder.finish()
                 } else {
@@ -241,10 +243,10 @@ impl FromIterator<Option<Series>> for ListChunked {
                             for _ in 0..init_null_count {
                                 builder.append_null();
                             }
-                            builder.append_series(first_s);
+                            builder.append_series(first_s).unwrap();
 
                             for opt_s in it {
-                                builder.append_opt_series(opt_s.as_ref());
+                                builder.append_opt_series(opt_s.as_ref()).unwrap();
                             }
                             builder.finish()
                         }
@@ -261,10 +263,10 @@ impl FromIterator<Option<Series>> for ListChunked {
                             for _ in 0..init_null_count {
                                 builder.append_null();
                             }
-                            builder.append_series(first_s);
+                            builder.append_series(first_s).unwrap();
 
                             for opt_s in it {
-                                builder.append_opt_series(opt_s.as_ref());
+                                builder.append_opt_series(opt_s.as_ref()).unwrap();
                             }
                             builder.finish()
                         }
@@ -295,6 +297,27 @@ impl FromIterator<Option<Box<dyn Array>>> for ListChunked {
         let mut builder = AnonymousListBuilder::new("collected", cap, None);
         for val in &vals {
             builder.append_opt_array(val.as_deref());
+        }
+        builder.finish()
+    }
+}
+
+#[cfg(feature = "dtype-array")]
+impl ArrayChunked {
+    pub(crate) unsafe fn from_iter_and_args<I: IntoIterator<Item = Option<Box<dyn Array>>>>(
+        iter: I,
+        width: usize,
+        capacity: usize,
+        inner_dtype: Option<DataType>,
+        name: &str,
+    ) -> Self {
+        let mut builder =
+            AnonymousOwnedFixedSizeListBuilder::new(name, width, capacity, inner_dtype);
+        for val in iter {
+            match val {
+                None => builder.push_null(),
+                Some(arr) => builder.push_unchecked(arr.as_ref(), 0),
+            }
         }
         builder.finish()
     }
@@ -398,14 +421,9 @@ where
     fn from_par_iter<I: IntoParallelIterator<Item = T::Native>>(iter: I) -> Self {
         // Get linkedlist filled with different vec result from different threads
         let vectors = collect_into_linked_list(iter);
-        let capacity: usize = get_capacity_from_par_results(&vectors);
-
-        let mut av = Vec::<T::Native>::with_capacity(capacity);
-        for v in vectors {
-            av.extend_from_slice(&v)
-        }
-        let arr = to_array::<T>(av, None);
-        unsafe { NoNull::new(ChunkedArray::from_chunks("", vec![arr])) }
+        let vectors = vectors.into_iter().collect::<Vec<_>>();
+        let values = flatten_par(&vectors);
+        NoNull::new(ChunkedArray::new_vec("", values))
     }
 }
 
@@ -698,7 +716,7 @@ impl FromParallelIterator<Option<Series>> for ListChunked {
 
                 for v in vectors {
                     for val in v {
-                        builder.append_opt_series(val.as_ref());
+                        builder.append_opt_series(val.as_ref()).unwrap();
                     }
                 }
                 builder.finish()
@@ -708,7 +726,7 @@ impl FromParallelIterator<Option<Series>> for ListChunked {
                     get_list_builder(dtype, value_capacity, list_capacity, "collected").unwrap();
                 for v in &vectors {
                     for val in v {
-                        builder.append_opt_series(val.as_ref());
+                        builder.append_opt_series(val.as_ref()).unwrap();
                     }
                 }
                 builder.finish()
